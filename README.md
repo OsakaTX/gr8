@@ -1,3 +1,29 @@
+> ## Welcome
+>
+> **Custom GLM 5.3 engine for 6× DGX Spark. Private preview.**
+>
+> - **What it is:** an inference engine for GLM 5.3 full written from scratch. No vLLM; our own CUDA kernels plus a small server. It runs across 6 Sparks.
+> - **Where it's at (6 Sparks, one session):**
+>   - ~1,950 tok/s prefill at 8K (TTFT ~4.2 s)
+>   - ~37 tok/s prose decode
+>   - 614K context; a 254K prompt prefills in ~176 s
+> - **What's in the repo:**
+>   - engine source
+>   - a converter that builds the weight packs from public HF weights
+>   - one-command launch/stop scripts
+>   - docs on every setting
+>   - a map of what's GLM-specific vs reusable (for other models)
+> - **Known limits:**
+>   - one request at a time (multi-session is in progress)
+>   - decode slows past the replicated context window (being worked on)
+>   - launch scripts not yet run outside our own setup
+>   - no 4-Spark version yet
+> - **Where help would be great:**
+>   - multi-session at long context
+>   - decode cost with context split across nodes
+>   - trying it on other models
+> - Feedback, issues and PRs all welcome. If you run it, tell us what breaks.
+
 # g6: a custom GLM 5.3 (full) engine for six DGX Sparks
 
 g6 is a from-scratch CUDA inference engine for the full GLM 5.3 model (MoE, 256 experts, MLA attention with the sparse

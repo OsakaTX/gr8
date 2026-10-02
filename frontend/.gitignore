@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+/assets/
+/tests/tools/results.jsonl
+/tests/work/

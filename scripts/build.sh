@@ -1,0 +1,16 @@
+#!/bin/bash
+# Build the K1H2 engine (g6m4 = one rank on the real fabric, m4sim = one GPU simulating six ranks) on ONE Spark.
+# Needs CUDA 13 (nvcc with sm_121a), g++ with C++20, libibverbs-dev, cuBLAS. A few minutes on a GB10, CPU only.
+#   scripts/build.sh [OUT_DIR]            default OUT_DIR = ./bin
+# These -D flags are the K1H2 build; every one of them is an engine path that our A/B tests promoted
+# (see docs/SETTINGS.md). Dropping one builds an older, slower or less-checked path, not a broken one.
+set -eu
+REPO=$(cd "$(dirname "$0")/.." && pwd)
+OUT=$(mkdir -p "${1:-$REPO/bin}" && cd "${1:-$REPO/bin}" && pwd)
+K1H2_FLAGS="-DPF_FC2GL=6 -DPF_GEMMF=1 -DPF_XQ8C=1 -DPF_RNWIDE=1 -DPF_GEMMR=1 -DPF_DRAFTKV -DPF_GEMMRF=1 -DPF_QOBH=1 \
+-DDEC_SLOT=2 -DDEC_CPB=1 -DDEC_AVP=1 -DPF_QOROPE=1 -DPF_ISGRT=1 -DPF_ROPE2=1 -DDEC_CPB2=64 -DDEC_I4PAIR=1 -DSEL32 \
+-DG6_CP=1 -DG6_CP_PF_HASH2=1"
+cd "$REPO/engine/runtime"
+EXTRA="$K1H2_FLAGS ${EXTRA:-}" OUT="$OUT" bash build_m4.sh "${ARCH:-121a}" all
+strings "$OUT/g6m4" | grep -q "G6_CP_PF_HASH2 build" && echo "HASH2 build marker: present"
+md5sum "$OUT/g6m4" "$OUT/m4sim"

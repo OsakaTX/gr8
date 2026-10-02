@@ -1,0 +1,81 @@
+# K1H2 settings
+
+`scripts/launch_tp6.sh` sets everything below. Every rank gets the same environment and flags, except `--rank`.
+The source comments in `engine/runtime/` (`g6m4.cu`, `prefill.cuh`, `rank.cuh`) are the full reference. This file is
+the short version.
+
+## Engine flags (`g6m4`)
+
+| flag | K1H2 value | meaning |
+|---|---|---|
+| `--rank R` | 0..5 | this process's rank; rank r loads `rank<r>.pack` |
+| `--ips a,..` / `--ips2 a,..` | from `cluster.env` | RoCE v2 address of every rank on rail 1 / rail 2, in rank order |
+| `--proxy-cpu N` | 19 | CPU core for the fabric proxy thread (the CP fabric's proxy uses N-1) |
+| `--manifest` / `--pack` | `packs/rank<r>.*` | this rank's pack; `--pack -` reads it from stdin |
+| `--image` | on | load the whole pack into one device image (required for full packs) |
+| `--layers all` | all | all 78 layers + the MTP layer |
+| `--qo-manifest` / `--qo-pack` | `packs/qo.*` | full-head attention weights for `G6_PF_OWN=3` (identical file on every node) |
+| `--serve DIR` | `$G6_HOME/serve` | serve loop: requests arrive as `DIR/req.<n>`, rank 0 writes `DIR/resp.<n>`, `DIR/quit` ends it, `DIR/ready` appears once loaded |
+| `--cap N` | 614400 | KV pool in tokens (the longest context) |
+| `--mtp K` | 2 | MTP speculative draft length |
+| `--graph` | on | decode runs as captured CUDA graphs, one per row count |
+| `--wide` | on | the experts' fc1 records are reordered into the wide order at load (`rank.cuh`; outputs bit-identical) |
+| `--prefill MP` | 4096 | prompt tokens go through the prefill path in sub-batches of up to MP rows |
+| `--pf-lanes 2` | 2 | two prefill sub-batches in flight as two lanes |
+| `--pfv2` | on | the v2 prefill path (tensor-core attention). `G6_PF_OWN>=2` and `G6_DEC_SHARED_SCRATCH` need it |
+| `--chunk 8` | 8 | `Plan::chunk` of the step plan (`rank.cuh`); 8 is what we serve with |
+| `--temp 0.7` / `--top-p-cands 256` | | engine default temperature (each request carries its own through the shim) / top-p candidates per rank per row (256 = served) |
+| `--no-hash` | off (`NOHASH=1`) | skip the sha256 check of every pack tensor at load |
+
+## Engine environment
+
+| variable | K1H2 | meaning |
+|---|---|---|
+| `G6_PF_TILE` | 64 | prefill attention query tile (64/128/256) |
+| `G6_PF_DENSE` | 8192 | context threshold for the dense prefill attention path; past it the sparse (indexer-selected) path runs; 0 = always sparse |
+| `G6_PF_RS` | 1 | prefill uses reduce-scatter + all-gather instead of all-reduce |
+| `G6_PF_STREAMS` | 2 | the two prefill lanes run on two CUDA streams |
+| `G6_PF_ATTN_ROWS` | 1024 | prefill attention runs in chunks of this many rows inside a sub-batch |
+| `G6_PF_OWN` | 3 | row-owner prefill. 1 = the owner computes the next layer's projections. 2 = also the indexer. 3 = the owner runs the whole attention block for all 64 heads of its rows (QO; needs the QO pack, `G6_PF_RS=1`, `--pfv2`) |
+| `G6_PF_BLAS_ROWS` | 1024 | prefill cuBLAS calls in chunks of this many rows (multiple of 16) |
+| `G6_PF_TIMES` | 1 | per-request prefill timing lines in rank 0's log |
+| `G6_PF_HASH_GPU` | 1 | the per-sub-batch residual hash (rank agreement check) is computed on the GPU |
+| `G6_PF_RSDIRECT` | 1 | o_proj, dense down and the MoE final sum write straight into the reduce-scatter send slot |
+| `G6_DEC_SPLIT` | 3 | the decode step is captured as two graphs split at layer 3, so the second submission overlaps the first one's GPU time |
+| `G6_DEC_SHARED_SCRATCH` | 1 | one decode attention scratch for all layers (frees memory for the big pool; needs `--pfv2`) |
+| `G6_CP` | 1 | context-parallel KV on (build flag `-DG6_CP=1` too) |
+| `G6_CP_R` | 32768 | the first R tokens of KV are replicated on every rank. Pages past R are spread across ranks (multiple of 64) |
+| `G6_CP_S3` | 1 | CP combine order (1 = head-group overlap order, same arithmetic as 0) |
+| `G6_CP_PF_VERIFY` | 1 | check every KV page staged to another rank against a hash |
+| `G6_CP_PF_HASH2` | 1 | the fast HASH2 page hash for that check (build flag `-DG6_CP_PF_HASH2=1`). This is the "H2" in K1H2 |
+
+`G6ENV_X="NAME=value ..."` adds more variables on every rank. The engine rejects bad `G6_PF_*` values at startup
+(`engine/runtime/envparse.h`).
+
+## Build flags (`scripts/build.sh`)
+
+Each `-D` selects a kernel or host-path variant that won an A/B on our cluster. Without it the build uses the earlier
+path. The `#if` blocks and their comments in the source are the reference:
+
+| flag | what it selects (from the source comment at its `#if`) |
+|---|---|
+| `PF_FC2GL=6` | prefill expert fc2: one CTA loops over 6 consecutive 128-column groups (`kernels/bind_prefill.cuh`) |
+| `PF_GEMMF` | MXFP8 prefill GEMM with an unguarded mma loop for full tiles |
+| `PF_GEMMR`, `PF_GEMMRF` | GEMM launch order with the row block fastest, so CTAs sharing a weight tile run together (`GEMMRF`: owner-row launches) |
+| `PF_XQ8C` | activation-quantize kernel variant: one CTA = one 16-row block x 16 k-groups |
+| `PF_RNWIDE` | reduce-scatter add + RMSNorm with one 768-thread CTA per row instead of an 8-CTA cluster (`runtime/prefill.cuh`) |
+| `PF_DRAFTKV` | in prefill, the MTP layer only fills its caches; its output is dropped |
+| `PF_QOBH`, `PF_QOROPE`, `PF_ROPE2` | QO attention variants (`attn/prefill-qo-bind.cuh`, `attn/attn.cu`): RoPE from a precomputed table, bit-equal to the computed one |
+| `PF_ISGRT` | the prefill index scorer re-tiled: a CTA keeps its 64-key tile and walks several rows (`attn/prefill.cuh`) |
+| `DEC_SLOT=2` | decode partial producers write straight into the send slot and ring the doorbell themselves (`kernels/decslot.cuh`) |
+| `DEC_CPB=1`, `DEC_CPB2=64` | decode attention prefetches the fp8 pairs of the next 64 slots before their FMAs (same output bytes) |
+| `DEC_AVP=1` | decode absorb / value-project for small row counts in one launch |
+| `DEC_I4PAIR=1` | decode int4 records (q_a, o_proj) repacked once at load into a paired layout |
+| `SEL32` | the exact top-k selector is used past 32,768 tokens of context too |
+| `G6_CP=1`, `G6_CP_PF_HASH2=1` | context-parallel KV, and its HASH2 staged-page check |
+
+## Front end and shim
+
+`g6shim.py --rank-dirs <rank0 dir> <host:dir> ... --sock <sock> --max-model-len <cap> --stall-timeout 2400`
+(one request at a time). `python -m g6front --model-dir <tokenizer dir> --engine-sock <sock> --port 8100`. All
+front-end flags are in `frontend/README.md`.

@@ -1,0 +1,26 @@
+#!/bin/bash
+# build the M4 drivers. usage: build_m4.sh <arch: 121a (DGX Spark GB10) | 120a (RTX 50xx)> [sim|g6|all]
+# m4sim: one GPU, six simulated ranks. g6m4: one rank on the real fabric (needs libibverbs; Spark only).
+set -e
+cd "$(dirname "$0")"
+export PATH=/usr/local/cuda/bin:$PATH
+A=${1:-121a}
+WHAT=${2:-all}
+GEN="-gencode=arch=compute_${A},code=sm_${A} ${EXTRA:-}"   # EXTRA: optional nvcc flags, e.g. EXTRA=-DPF_FC2GL=6
+CPU=""
+[ "$(uname -m)" = aarch64 ] && CPU="-mcpu=neoverse-v2+crypto"
+OUT=${OUT:-../../bin}
+O=$OUT/obj                 # one object dir per variant (OUT): concurrent flag / NR builds never share objects
+mkdir -p $OUT $O
+nice -n 19 g++ -O3 -std=c++20 $CPU -pthread -c ../loader/g6pack.cpp -o $O/g6pack.o
+nice -n 19 g++ -O3 -std=c++20 $CPU -pthread -I/usr/local/cuda/include -c ../loader/devimage.cpp -o $O/devimage.o
+nice -n 19 nvcc -O3 -std=c++17 $GEN -c ../attn/attn.cu -o $O/attn.o
+nice -n 19 nvcc -O3 -std=c++17 $GEN -c ../attn/bind.cu -o $O/attn_bind.o
+if [ "$WHAT" != g6 ]; then
+  nice -n 19 nvcc -O2 -std=c++17 $GEN -o $OUT/m4sim m4sim.cu $O/attn.o $O/attn_bind.o $O/g6pack.o $O/devimage.o -lcublas -lpthread
+  ls -la $OUT/m4sim
+fi
+if [ "$WHAT" != sim ]; then
+  nice -n 19 nvcc -O2 -std=c++17 $GEN -o $OUT/g6m4 g6m4.cu ../comms/fabric.cpp $O/attn.o $O/attn_bind.o $O/g6pack.o $O/devimage.o -lcublas -libverbs -lpthread
+  ls -la $OUT/g6m4
+fi

@@ -1,0 +1,59 @@
+# What is GLM 5.3-specific, and what is not
+
+g6 was written for one model, GLM 5.3 (full), on one topology (six GB10 ranks). Nothing here is a plug-in model
+interface. This page is a map for porting: it lists every place the model is baked in, roughly in the order you would
+meet them. It also lists the parts that do not depend on the model.
+
+GLM 5.3 as g6 sees it: hidden 6144; 78 layers, of which 0-2 are dense MLP (intermediate 12288) and 3-77 are MoE with 256
+routed experts, top-8, expert intermediate 2048, plus one shared expert (2048); one MTP layer (index 78); MLA attention
+with 64 heads, q_lora 2048, kv_lora 512, qk 192 + 64 rope, v 256; a sparse indexer (32 heads x 128, top-2048 keys) on
+the full-index layers; vocab 154,880.
+
+## Model-specific: change these for another model
+
+| layer | where | what is fixed |
+|---|---|---|
+| weight format | `engine/kernels/tr3.cuh`, `tr3_gemm.cuh`, `tr3_wide.cuh` | routed experts are EXL3 "TR3" trellis codes (3.25 bpw, Hadamard-128 rotations, K3/K4 per-expert bit widths), decoded inside the expert kernels |
+| | `engine/kernels/densev.cuh`, `gemm_x.cuh`, `rowtile.cuh` | dense weights: MXFP8 for prefill + lm_head, GPTQ int4 g32 for decode |
+| converter | `tools/convert/plan.py` | `H = 6144`, 78 + 1 layers, 256 experts, the TP6 rank map: head groups `(11,11,11,11,10,10)`, expert 128-column blocks `(3,3,3,3,2,2)`, vocab tiles, rotated per layer |
+| | `tools/convert/convert.py` | checkpoint tensor names (`model.layers.N.self_attn.q_a_proj.weight`, ...), MLA reshapes (`q_b` -> 64 x 256 x 2048, `kv_b` -> 64 x 448 x 512), dense layers 0-2, the MTP layer's extra tensors (`eh`) |
+| | `tools/convert/qopack.py` | `QO_EDGES` head-group edges for the full-head QO pack |
+| | `engine/ref/g6ref.py` | record layouts the kernels read (rt_record, GEMV records) |
+| kernels | `engine/kernels/common.cuh` | `HID = 6144` |
+| | `engine/kernels/k1args.cuh` | `SMAX = 72` distinct experts per step, `ACTW = 384` routed columns per rank, `SACTW = 2048` shared/dense columns |
+| | `engine/kernels/glue.cuh`, `k1.cuh` | router (sigmoid top-8 of 256 + shared), RMSNorm, embed, head local argmax/LSE + sampling |
+| attention | `engine/attn/` | MLA latent attention (kv_a 576 = 512 + 64 rope, UK/UV absorb), the DSA-style sparse indexer and its exact top-2048 selector (`select.cuh`), value head dim 256 in decode (`decode-small.cuh`) |
+| | `engine/runtime/rank.cuh` | `QA = 2048`, `KVA = 576`, `IDXQ = 4096`, `IDXK = 128`, `IDXW = 32`; the layer sequence (dense / MoE / MTP) |
+| | `engine/runtime/qo_weights.cuh`, `attn/prefill-qo-*` | full-head QO attention shapes |
+| front end | `frontend/g6shim.py` | `EOS_IDS = [154820, 154827, 154829]`, `VOCAB = 154880` |
+| | `frontend/g6front/glm_parser.py` | GLM's `<think>` reasoning and `<tool_call>NAME<arg_key>..</arg_key><arg_value>..</arg_value></tool_call>` format |
+| | `frontend/g6front/template.py`, `tokenizer.py` | read `chat_template.jinja` / `tokenizer.json` from `--model-dir`, so these follow the model directory |
+
+## Topology-specific (TP6)
+
+- `engine/g6nr.h`: the rank count `G6_NR`. Default 6; the engine also compiles for divisors of 64 (`-DG6_NR=4` is our
+  TP4 build, which is not part of this snapshot). Any other count needs the matching rank map.
+- `tools/convert/plan.py`: `NR = 6` and the widths above. The converter only writes TP6 packs.
+- `tools/convert/convert.py --d8`: six GPTQ dirs, one per rank, because the GPTQ codes are solved per rank slice.
+
+## Not model-specific: reusable as is
+
+| part | where |
+|---|---|
+| RoCE v2 verbs fabric: device discovery by IP, two rails, all-reduce / reduce-scatter / all-gather with device doorbells, bulk proxy | `engine/comms/` |
+| pack format (sequential tensors, 4096-byte alignment, sha256 per tensor in a JSON manifest), writer, checker | `tools/convert/pack.py`, `checkpack.py`, `engine/loader/` |
+| device image loader (whole pack into one allocation, optional hash check) | `engine/loader/devimage.*` |
+| serve loop (file protocol), step plan, CUDA graph capture per row count, MTP draft/verify loop | `engine/runtime/serve.h`, `rank.cuh` |
+| context-parallel KV layout and the staged-page hash check | `engine/comms/cplayout.h`, `engine/runtime/prefill.cuh` (CP sections) |
+| OpenAI/vLLM-compatible HTTP server, metrics, streaming, socket protocol | `frontend/g6front/`, `PROTOCOL.md` |
+| launch / stage / stop scripts | `scripts/` |
+
+## A realistic porting path
+
+1. Start with a model whose blocks match: MLA + MoE, ideally the same EXL3 trellis format. Then most changes are the
+   constants above and the converter's tensor names.
+2. Keep `m4sim` as the test bed. It is one GPU simulating all six ranks on a few layers (`--layers 0,3,40,77`), and
+   `scripts/build.sh` builds it. Every rank's step lines must match the six-rank run on the same packs. That is how we
+   checked each kernel change.
+3. A different attention type (GQA, no indexer) or a different expert format is new kernel work in `engine/attn/` or
+   `engine/kernels/`, not a configuration change.

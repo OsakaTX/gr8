@@ -1,0 +1,622 @@
+// M4 runtime: ONE rank of the mini model (a list of real layers + the real head) on the real fabric, one
+// process per Spark. Same rank step (rank.cuh) and same test sequence as m4sim; every rank prints the "step ..."
+// lines, and all six must equal m4sim's on the same packs.
+//
+// Per step: host writes the StepIn block (pinned), hands the proxy the payload sizes of the step's 2*NL+1
+// collectives, launches the whole step on one stream (plain launches, or with --graph one replayed graph), waits for
+// the stream, checks the fabric and attention error words. The token every rank samples is the same, so the ranks stay in
+// step without host messages; fab.barrier() after the load lines the first step up.
+//
+// g6m4 --rank R --ips a,b,.. [--ips2 a,b,..] [--proxy-cpu N] --manifest rankR.manifest.json --pack rankR.pack|-
+//      [--image]      stream the pack straight into one device image (g6::DevImage; needed for a full 60 GB pack)
+//      [--layers 0,3,40,77] [--prompt 154822,154824,154826,25062] [--gen 16] [--temp 0] [--seed 1234] [--cap 64] [--chunk 4]
+//      [--graph]      one captured graph per row count instead of plain launches (same lines)
+//      [--prefill MP] every prompt token but the last goes through the prefill path in sub-batches of up to MP rows,
+//                     on a second fabric region (two collectives of MP rows, the layer as its step; prefill.cuh)
+//      --prompt may be repeated: each is its own sequence (attention caches reset in between); "@file" reads ids
+//      [--serve DIR]  requests from DIR/req.<n> until DIR/quit, rank 0 streams DIR/resp.<n> (serve.h); --prompt is ignored
+//      [--top-p F] [--top-p-cands N]  nucleus sampling at T (per request with --serve); N candidates per rank per row
+//                     (0 = top_p off; 256 is the served setting; misses printed at the end)
+#include <algorithm>
+#include <chrono>
+#include "packfind.h"
+#include "prefill.cuh"
+#include "serve.h"
+#include "../comms/fabric.h"
+
+using namespace g6rt;
+
+static std::vector<std::string> split(const std::string& s, char c)
+{
+    std::vector<std::string> v;
+    size_t a = 0, b;
+    while ((b = s.find(c, a)) != std::string::npos) { v.push_back(s.substr(a, b - a)); a = b + 1; }
+    if (a < s.size()) v.push_back(s.substr(a));
+    return v;
+}
+
+int main(int argc, char** argv)
+{
+    setvbuf(stdout, nullptr, _IOLBF, 0);
+    pf_env_check();                    // strict G6_PF_* choices (envparse.h): a bad value exits before any work
+    g6::FabricConfig cfg;
+    std::string manifest, packfile, layers_s = "0,3,40,77";
+    std::string qo_man, qo_file;        // --qo-manifest/--qo-pack: full-head QO weights (tools/convert/qopack.py), G6_PF_OWN=3
+    std::vector<std::string> prompts;
+    Plan plan;
+    int cap = 64;
+    float temp = 0.f;
+    bool graph = false, image = false, hash = true;
+    int MP = 0, top = 0;
+    bool wide = false, pfv2 = false;
+    int pfrows = 0, mtp = 0, lanes = 1;
+    std::string serve;
+    int nc = 0;                         // --top-p-cands N: top_p candidates per rank per row (0 = top_p off)
+    for (int i = 1; i < argc; ++i)
+    {
+        const std::string a = argv[i];
+        auto next = [&]() { if (i + 1 >= argc) die("missing value for " + a); return std::string(argv[++i]); };
+        if (a == "--rank") cfg.rank = atoi(next().c_str());
+        else if (a == "--ips") cfg.ips = split(next(), ',');
+        else if (a == "--ips2") cfg.ips2 = split(next(), ',');
+        else if (a == "--proxy-cpu") cfg.proxy_cpu = atoi(next().c_str());
+        else if (a == "--manifest") manifest = next();
+        else if (a == "--pack") packfile = next();
+        else if (a == "--qo-manifest") qo_man = next();
+        else if (a == "--qo-pack") qo_file = next();
+        else if (a == "--layers") layers_s = next();
+        else if (a == "--prompt") prompts.push_back(next());
+        else if (a == "--gen") plan.n_gen = atoi(next().c_str());
+        else if (a == "--temp") temp = (float)atof(next().c_str());
+        else if (a == "--seed") plan.seed = (uint32_t)strtoul(next().c_str(), nullptr, 10);
+        else if (a == "--cap") cap = atoi(next().c_str());
+        else if (a == "--chunk") plan.chunk = atoi(next().c_str());
+        else if (a == "--graph") graph = true;
+        else if (a == "--image") image = true;
+        else if (a == "--no-hash") hash = false;
+        else if (a == "--prefill") MP = atoi(next().c_str());
+        else if (a == "--top") top = atoi(next().c_str());
+        else if (a == "--wide") wide = true;
+        else if (a == "--pfv2") pfv2 = true;
+        else if (a == "--pf-rows") pfrows = atoi(next().c_str());
+        else if (a == "--mtp") mtp = atoi(next().c_str());
+        else if (a == "--pf-lanes") lanes = atoi(next().c_str());
+        else if (a == "--serve") serve = next();
+        else if (a == "--top-p") plan.top_p = (float)atof(next().c_str());
+        else if (a == "--top-p-cands") nc = atoi(next().c_str());
+        else die("unknown argument " + a);
+    }
+    if (cfg.rank < 0 || cfg.ips.size() != 6 || manifest.empty() || packfile.empty())
+        die("usage: g6m4 --rank R --ips six,addresses [--ips2 ..] --manifest M --pack P|- [--qo-manifest QM --qo-pack QP] [--layers ..] [--gen N] [--temp T]");
+    { const char* e = getenv("G6_DEC_SHARED_SCRATCH"); if (e && atoi(e) == 1 && !pfv2) die("G6_DEC_SHARED_SCRATCH=1 needs --pfv2"); }
+    const std::vector<int> layers = parse_ints(layers_s);
+    if (prompts.empty()) prompts.push_back("154822,154824,154826,25062");
+    plan.inv_temp = temp > 0.f ? 1.f / temp : 0.f;
+    if (plan.chunk < 1 || plan.chunk > MX) die("--chunk must be 1..8");
+    if (mtp < 0 || mtp > MX - 1) die("--mtp must be 1..7 drafts");
+    if (nc < 0 || nc * 6 > glue::TP_SORT) die("--top-p-cands must be 0..341");
+    std::vector<Plan> plans;            // one sequence per --prompt
+    std::vector<int> row_counts;
+    for (const std::string& ps : prompts)
+    {
+        Plan p = plan;
+        p.prompt = parse_ints(ps);
+        if (p.prompt.empty()) die("empty prompt");
+        if ((int)p.prompt.size() + p.n_gen + 2 * mtp > cap) die("prompt + gen (+ 2 x drafts) exceeds --cap");
+        if (MP) { const int pr = pfrows < 0 ? (int)p.prompt.size() + pfrows : pfrows;   // --pf-rows -N: all rows but the last N
+                  p.first = pr > 0 && pr < (int)p.prompt.size() - 1 ? pr : (int)p.prompt.size() - 1; }   // --pf-rows: the rest is teacher-forced through decode steps
+        for (int M : plan_rows(p))
+            if (std::find(row_counts.begin(), row_counts.end(), M) == row_counts.end()) row_counts.push_back(M);
+        plans.push_back(p);
+    }
+    if (!serve.empty())                 // any prompt: every prompt-step row count 1..chunk
+        for (int M = 1; M <= plan.chunk; ++M)
+            if (std::find(row_counts.begin(), row_counts.end(), M) == row_counts.end()) row_counts.push_back(M);
+    std::vector<int> draft_rows;        // row counts of first-form draft passes: the prompt steps' and 1..K+1
+    if (mtp)
+    {
+        draft_rows = row_counts;
+        for (int M = 1; M <= mtp + 1; ++M)
+            if (std::find(draft_rows.begin(), draft_rows.end(), M) == draft_rows.end()) draft_rows.push_back(M);
+        if (std::find(row_counts.begin(), row_counts.end(), mtp + 1) == row_counts.end()) row_counts.push_back(mtp + 1);
+    }
+    const int NL = (int)layers.size(), NC = 2 * NL + 1, R = cfg.rank;
+
+    G6RT_CK(cudaSetDeviceFlags(cudaDeviceMapHost));
+    cfg.slot_bytes = (size_t)MX * HID * 2;
+    cfg.ncoll = NC;
+    g6::Fabric fab;
+    fab.init(cfg);
+    const g6::FabricDev f = fab.dev();
+    fab.start_proxy();
+    g6::Fabric fabp;                    // prefill region
+    const bool pf_rs = getenv("G6_PF_RS") && atoi(getenv("G6_PF_RS")) == 1;     // reduce-scatter form (prefill.cuh)
+    const int pf_own = getenv("G6_PF_OWN") ? atoi(getenv("G6_PF_OWN")) : 0;   // 1: row-owner projections, 2: + index (prefill.cuh)
+    const bool pf_qo = MP && pf_own == 3;                                        // 3: row-owner QO attention (QO-INTEGRATION.md)
+    if (pf_qo && (qo_man.empty() || qo_file.empty())) die("G6_PF_OWN=3 needs --qo-manifest and --qo-pack");
+    if (MP)
+    {
+        g6::FabricConfig cp = cfg;
+        cp.slot_bytes = pf_slot_bytes(MP, pf_rs, (int)cfg.ips.size());
+        cp.ncoll = pf_rs ? 5 : 2;
+        cp.port = cfg.port + 8;
+        cp.proxy_cpu = cfg.proxy_cpu > 0 ? cfg.proxy_cpu - 1 : -1;
+        fabp.init(cp);
+        fabp.start_proxy();
+    }
+    if (lanes != 1 && lanes != 2) die("--pf-lanes must be 1 or 2");
+    const bool two = MP && lanes == 2;
+    g6::Fabric fabp2;                   // prefill region of the second lane (--pf-lanes 2)
+    if (two)
+    {
+        g6::FabricConfig cp = cfg;
+        cp.slot_bytes = pf_slot_bytes(MP, pf_rs, (int)cfg.ips.size());
+        cp.ncoll = pf_rs ? 5 : 2;
+        cp.port = cfg.port + 24;
+        cp.proxy_cpu = cfg.proxy_cpu > 1 ? cfg.proxy_cpu - 2 : -1;
+        fabp2.init(cp);
+        fabp2.start_proxy();
+    }
+    g6::Fabric fabd;                    // MTP draft region: 3 collectives, decode-sized slots
+    if (mtp)
+    {
+        g6::FabricConfig cd = cfg;
+        cd.ncoll = 3;
+        cd.port = cfg.port + 16;
+        cd.proxy_cpu = cfg.proxy_cpu > 1 ? cfg.proxy_cpu - 2 : -1;
+        fabd.init(cd);
+        fabd.start_proxy();
+    }
+#if defined(G6_CP) && G6_CP
+    // J4 CP (BUILD-CPE): env as m4sim (G6_CP, G6_CP_R, G6_CP_S3, G6_CP_MMAX). Own fabric `fabc` (cplayout.h variable
+    // layout: per-collective slots, single-destination partials), port + 32, its own proxy CPU.
+    const bool cp_on = !getenv("G6_CP") || atoi(getenv("G6_CP")) != 0;
+    const int cp_R = getenv("G6_CP_R") ? atoi(getenv("G6_CP_R")) : 0;
+    const int cp_s3 = getenv("G6_CP_S3") ? atoi(getenv("G6_CP_S3")) : 1;
+    int cp_mmax = mtp + 1;
+    for (int M : row_counts) cp_mmax = std::max(cp_mmax, M);
+    if (getenv("G6_CP_MMAX")) cp_mmax = std::max(cp_mmax, atoi(getenv("G6_CP_MMAX")));
+    if (cp_R < 0 || cp_R % 64) die("G6_CP_R must be a multiple of 64");
+    g6::CpColls cp_colls;
+    {
+        std::vector<bool> full;
+        for (int l : layers) full.push_back(cp_full_index(l));
+        cp_colls.make(full, (int)cfg.ips.size(), cp_mmax);
+    }
+    g6::Fabric fabc;
+    if (cp_on)
+    {
+        g6::FabricConfig cc = cfg;
+        cc.vcap = cp_colls.cap;
+        cc.vdst_k = cp_colls.dst_k;
+        cc.port = cfg.port + 32;
+        cc.proxy_cpu = cfg.proxy_cpu > 2 ? cfg.proxy_cpu - 3 : -1;
+        fabc.init(cc);
+        fabc.start_proxy();
+        fprintf(stderr, "# rank %d: G6_CP fabric %d collectives, mmax %d, %.3f GB pinned + registered\n", cfg.rank, cp_colls.ncoll(),
+                cp_mmax, (fabc.vlayout().send_bytes() + fabc.vlayout().recv_bytes()) / 1e9);
+    }
+    // enqueue the CP collectives of a step that runs the CP block (context > R), before its GPU work
+    auto cp_enqueue = [&](unsigned long long step, int M, int context) { if (cp_on && context > cp_R) fabc.enqueue_step(step, cp_colls.sizes(M)); };
+    auto cp_error = [&]() -> unsigned { return cp_on ? *fabc.dev().error : 0u; };
+#else
+    auto cp_enqueue = [&](unsigned long long, int, int) {};
+    auto cp_error = [&]() -> unsigned { return 0u; };
+#endif
+    G6RT_CK(bind::init());
+    pf_prof().on = getenv("G6_PF_PROF") != nullptr;
+    if (getenv("G6_DEC_PROF") && graph) die("G6_DEC_PROF needs plain launches (no --graph)");
+    cudaStream_t st;
+    G6RT_CK(cudaStreamCreateWithFlags(&st, cudaStreamNonBlocking));
+
+    g6::Pack pack;
+    DevStore store;
+    Model m;
+    g6::DevImage img;
+    if (image) load_image(pack, img, manifest, packfile, R, hash);
+    else load_pack(pack, manifest, packfile, R);
+    u64* stepp = dmalloc<u64>(1);
+    StepIn* in;
+    StepOut* out;
+    G6RT_CK(cudaHostAlloc((void**)&in, sizeof(StepIn), cudaHostAllocMapped));
+    G6RT_CK(cudaHostAlloc((void**)&out, sizeof(StepOut), cudaHostAllocMapped));
+    const Find find = image ? image_find(pack, img) : pack_find(pack, store);
+    g6::Pack qo_pack;
+    g6::DevImage qo_img;                // --image: the qo pack streamed into one device allocation (no host copy)
+    std::vector<QoW> qow;               // pf_qo: full-head weights per model layer
+    if (pf_qo)
+    {
+        if (image) load_image(qo_pack, qo_img, qo_man, qo_file, 0, hash);
+        else load_pack(qo_pack, qo_man, qo_file, 0);
+        const Find qfind = image ? image_find(qo_pack, qo_img) : pack_find(qo_pack, store);
+        for (int l : layers)
+        {
+            QoW w;
+            if (!qo_from_pack(qfind, l, w)) die("--qo-pack has no full-head tensors for layer " + std::to_string(l));
+            qow.push_back(w);
+        }
+        fprintf(stderr, "# rank %d: G6_PF_OWN=3 full-head q_b / o_proj / UK / UV for %zu layers\n", R, qow.size());
+    }
+    m.wide = wide;
+#if defined(G6_CP) && G6_CP
+    m.cp.on = cp_on; m.cp.R = cp_R; m.cp.s3 = cp_s3; m.cp.colls = cp_colls;
+#endif
+    build(m, R, layers, find, cap, f, stepp, st, pf_attn_rows(MP));   // bindings sized for the attention chunk
+#if defined(G6_CP) && G6_CP
+    if (cp_on)
+        for (int c = 0; c < cp_colls.ncoll(); ++c)
+        {
+            g6::VSlotDev v = fabc.vslot(c);
+            v.error = f.error;              // GPU-side CP wait timeouts land in the error word the step loop checks
+            m.cp.vs.push_back(v);
+        }
+    // step 4d: CP prefill staging pools = the registered area of a bulk-mode fabric (prefill.cuh CpPfNet)
+    g6::Fabric fabs;
+    const bool cp_pf = cp_on && MP;
+    if (cp_pf)
+    {
+        g6::FabricConfig sc = cfg;
+        sc.vcap.clear(); sc.vdst_k.clear();
+        sc.bulk_bytes = 2 * cp_pf_pool_bytes(m);
+        sc.bulk_flags = 4;
+        sc.port = cfg.port + 48;
+        sc.proxy_cpu = cfg.proxy_cpu > 3 ? cfg.proxy_cpu - 4 : -1;
+        fabs.init(sc);
+        fabs.start_proxy();
+        cp_pf_net_init(m, fabs, st);
+    }
+    auto cp_pf_in = [&]() { if (cp_pf) cp_pf_enter(m); };
+    auto cp_pf_out = [&]() { if (cp_pf) cp_pf_exit(m); };
+    auto cp_pf_err = [&]() -> unsigned { return cp_pf ? *fabs.bulk_dev().error : 0u; };
+#else
+    auto cp_pf_in = [&]() {};
+    auto cp_pf_out = [&]() {};
+    auto cp_pf_err = [&]() -> unsigned { return 0u; };
+#endif
+    FILE* rlf = R == 0 ? route_log_open(m) : nullptr;     // G6_ROUTE_LOG=<file> (measurement, MTP main steps)
+    m.graph = graph; m.in = in; m.out = out;
+    Prefill P;
+    g6::FabricDev fp{};
+    if (MP)
+    {
+        fp = fabp.dev();
+        P.v2 = pfv2;
+        P.own = pf_own >= 1; P.ownix = pf_own == 2;
+        P.qo = pf_qo; P.qow = &qow;
+        P.attn_rows = pf_attn_rows(MP);
+        build_prefill(P, m, find, MP, fp, dmalloc<u64>(1), st);
+    }
+    Prefill P2;
+    g6::FabricDev fp2{};
+    if (two)
+    {
+        fp2 = fabp2.dev();
+        P2.attn_rows = pf_attn_rows(MP);
+        P2.own = pf_own >= 1; P2.ownix = pf_own == 2;
+        P2.qo = pf_qo; P2.qow = &qow;
+        build_prefill(P2, m, find, MP, fp2, dmalloc<u64>(1), st, &P);
+    }
+    u64 ls0b = 1;
+    Draft D;
+    DraftPrefill DQ;
+    g6::FabricDev fd{};
+    StepIn* in_d = nullptr;
+    StepOut* out_d = nullptr;
+    if (mtp)
+    {
+        fd = fabd.dev();
+        G6RT_CK(cudaHostAlloc((void**)&in_d, sizeof(StepIn), cudaHostAllocMapped));
+        G6RT_CK(cudaHostAlloc((void**)&out_d, sizeof(StepOut), cudaHostAllocMapped));
+        build_draft(D, m, find, cap, fd, dmalloc<u64>(1), st, MP ? pf_attn_rows(MP) : MX);
+        D.d.graph = graph; D.d.in = in_d; D.d.out = out_d;
+        DQ.P.attn_rows = pf_attn_rows(MP);
+        if (MP) build_draft_prefill(DQ, D, find, MP, fp, pfv2, st, &P);
+    }
+    u64 ls0 = 1;
+    double pf_ms = 0;
+    long pf_rows = 0;
+    m.nc = nc; D.d.nc = nc;             // before any capture: the head kernels take it by value
+    for (int M : row_counts) prepare(m, M, st);
+    for (int M : draft_rows) prepare(D.d, M, st);
+    G6RT_CK(cudaStreamSynchronize(st));
+    cudaGraphExec_t exec[NBK][MX + 1] = {}, exec_d[NBK][2][MX + 1] = {};      // [context bucket][...]
+    // DEC_GSPLIT: G6_DEC_SPLIT=ls (1..nl-1) captures the target step as two graphs, exec = step_in, embed, layers [0, ls) and
+    // exec2 = the rest; launched back to back, the second graph's submission overlaps the first one's GPU time (0 = one graph)
+    const int gsplit = getenv("G6_DEC_SPLIT") ? atoi(getenv("G6_DEC_SPLIT")) : 0;
+    if (gsplit < 0 || gsplit >= NL || (gsplit && !graph)) die("G6_DEC_SPLIT must be 0..layers-1 and needs --graph");
+    cudaGraphExec_t exec2[NBK][MX + 1] = {};
+    auto launch_main = [&](int k, int M) {
+        G6RT_CK(cudaGraphLaunch(exec[k][M], st));
+        if (gsplit) G6RT_CK(cudaGraphLaunch(exec2[k][M], st));
+    };
+    auto capture = [&](const std::function<void()>& body, cudaGraphExec_t* ex, const char* what, int M) {
+        cudaGraph_t g;
+        G6RT_CK(cudaStreamBeginCapture(st, cudaStreamCaptureModeThreadLocal));
+        body();
+        G6RT_CK(cudaStreamEndCapture(st, &g));
+        size_t nodes = 0;
+        G6RT_CK(cudaGraphGetNodes(g, nullptr, &nodes));
+        G6RT_CK(cudaGraphInstantiate(ex, g, 0));
+        G6RT_CK(cudaGraphDestroy(g));
+        fprintf(stderr, "# rank %d: %sgraph for M=%d bucket %d, %zu nodes\n", R, what, M, m.bk[m.cur], nodes);
+    };
+    if (graph)
+    {
+        for (int k = 0; k < m.nbk; ++k)
+        {
+            m.cur = k;
+            for (int M : row_counts)
+                if (gsplit)
+                {
+                    capture([&] { launch_step(m, M, 0, st, 0, gsplit); }, &exec[k][M], "split part A ", M);
+                    capture([&] { launch_step(m, M, 0, st, 1, gsplit); }, &exec2[k][M], "split part B ", M);
+                }
+                else capture([&] { launch_step(m, M, 0, st); }, &exec[k][M], "", M);
+        }
+        if (mtp && D.d.nbk != m.nbk) die("draft and target context buckets differ");
+        for (int k = 0; mtp && k < D.d.nbk; ++k)
+        {
+            D.d.cur = m.cur = k;
+            for (int M : draft_rows) capture([&] { launch_draft_step(D, M, 0, false, st); }, &exec_d[k][0][M], "first draft ", M);
+            if (mtp > 1) capture([&] { launch_draft_step(D, 1, 0, true, st); }, &exec_d[k][1][1], "chain draft ", 1);
+        }
+    }
+    fprintf(stderr, "# rank %d: device tensors %.2f GB\n", R, (image ? img.bytes() : store.bytes) / 1e9);
+    const bool pf_streams = two && getenv("G6_PF_STREAMS") && atoi(getenv("G6_PF_STREAMS")) == 2;   // pf_step2s
+    if (pf_streams && pf_prof().on) die("G6_PF_STREAMS=2 cannot run with G6_PF_PROF (the marks synchronize one stream)");
+    PfLanes lanes2;
+    if (pf_streams)
+    {
+        pf_lanes_init(lanes2, m.nl);
+        fprintf(stderr, "# rank %d: prefill lanes on two streams\n", R);
+    }
+    if (MP && pf_rs) fprintf(stderr, "# rank %d: prefill reduce-scatter form (5 collectives, slice %zu B)%s\n", R, pf_ss(fp),
+                             pf_own >= 3 ? ", row-owner QO attention (G6_PF_OWN=3)" : pf_own >= 2 ? ", row-owner projections + index (G6_PF_OWN=2)" : pf_own ? ", row-owner projections (G6_PF_OWN)" : "");
+    fab.barrier();
+    if (R == 0) printf("# m4 layers %s, %zu sequences, chunks of %d, gen %d temp %g seed %u\n", layers_s.c_str(), plans.size(), plan.chunk, plan.n_gen, temp, plan.seed);
+
+    u64 step0 = 0, dstep = 0;
+    MtpStats mtp_stats;
+    int mtp_steps = 0;
+    std::vector<double> t1;             // single-row step times
+    Emitter em;
+    PfTimes pt;                         // G6_PF_TIMES=1 (serve.h)
+    if (!serve.empty()) serve_ready(serve);
+    for (size_t q = 0;; ++q)
+    {
+        Plan sp;
+        if (serve.empty())
+        {
+            if (q >= plans.size()) break;
+            sp = plans[q];
+        }
+        else
+        {
+            ServeReq rq;
+            if (!serve_next(serve, q, rq)) break;
+            pt.start(serve + "/req." + std::to_string(q));
+            sp = plan;
+            sp.prompt = rq.prompt; sp.n_gen = rq.n_gen; sp.seed = rq.seed;
+            sp.inv_temp = rq.temp > 0.f ? 1.f / rq.temp : 0.f;
+            sp.top_p = rq.top_p;
+            em.open(serve, q, R == 0, rq);
+            if (sp.prompt.empty() || sp.n_gen < 1 || (int)sp.prompt.size() + sp.n_gen + 2 * mtp > cap)
+            {
+                em.end("error", 0, 0, 0, nullptr);
+                continue;
+            }
+            if (MP) sp.first = (int)sp.prompt.size() - 1;
+        }
+        const Plan& p = sp;
+        const int PS = prompt_steps(p), NS = total_steps(p);
+        if (serve.empty()) pt.start("");
+        else pt.lap("open");
+        reset(m, st);
+        if (mtp) reset(D.d, st);
+        G6RT_CK(cudaStreamSynchronize(st));
+        pt.lap("reset");
+        printf("seq %zu prompt %zu tokens\n", q, p.prompt.size());
+        for (int a = 0; a < p.first; a += MP)
+        {
+            if (two && p.first - a > MP)         // two sub-batches as two lanes (prefill.cuh pf_step2)
+            {
+                const int MA = MP, MB = p.first - a - MP < MP ? p.first - a - MP : MP;
+                std::vector<int> pos(MA + MB);
+                for (int r = 0; r < MA + MB; ++r) pos[r] = a + r;
+                pf_inputs(P, MA, p.prompt.data() + a, pos.data());
+                pf_inputs(P2, MB, p.prompt.data() + a + MA, pos.data() + MA);
+                pt.lap("inputs_h2d");
+                pf_enqueue(fabp, P, ls0, NL, MA);
+                pf_enqueue(fabp2, P2, ls0b, NL, MB);
+                pt.lap("fabric_enqueue");
+                const auto t0 = std::chrono::steady_clock::now();
+                cp_pf_in();
+                if (pf_streams) pf_step2s(m, P, P2, MA, MB, a + MA, a + MA + MB, ls0, ls0b, st, lanes2);
+                else pf_step2(m, P, P2, MA, MB, a + MA, a + MA + MB, ls0, ls0b, st);
+                cp_pf_out();
+                G6RT_CK(cudaStreamSynchronize(st));
+                const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+                pt.lap("prefill");
+                ls0 += NL; ls0b += NL;
+                if (mtp)
+                {
+                    pf_draft_inputs(DQ, MA, p.prompt.data() + a + 1, pos.data());
+                    pf_draft(D, DQ, P.x, MA, a + MA, st);
+                    G6RT_CK(cudaStreamSynchronize(st));
+                    pf_draft_inputs(DQ, MB, p.prompt.data() + a + MA + 1, pos.data() + MA);
+                    pf_draft(D, DQ, P2.x, MB, a + MA + MB, st);
+                    G6RT_CK(cudaStreamSynchronize(st));
+                    if (const unsigned ae = attn_errors(D.d)) { fprintf(stderr, "g6m4: rank %d MTP layer attention error word %08x, seq %zu prefill rows %d..\n", R, ae, q, a); return 3; }
+                }
+                pt.lap("draft_prefill");
+                if (*fp.error || *fp2.error || cp_pf_err()) { fprintf(stderr, "g6m4: rank %d prefill fabric error word %08x / %08x (CP staging %08x), seq %zu rows %d..\n", R, *fp.error, *fp2.error, cp_pf_err(), q, a); return 3; }
+                if (const unsigned ae = attn_errors(m)) { fprintf(stderr, "g6m4: rank %d attention error word %08x, seq %zu prefill rows %d..\n", R, ae, q, a); return 3; }
+                printf("prefill rows %d..%d resid %016llx\n", a, a + MA - 1, (unsigned long long)pf_hash(P, MA));
+                printf("prefill rows %d..%d resid %016llx\n", a + MA, a + MA + MB - 1, (unsigned long long)pf_hash(P2, MB));
+                fprintf(stderr, "# seq %zu prefill %d + %d rows (two lanes): %.3f ms (%.0f tok/s)\n", q, MA, MB, ms, (MA + MB) * 1000.0 / ms);
+                pt.lap("checks_hash");
+                if (q > 0 || a > 0) { pf_ms += ms; pf_rows += MA + MB; }
+                a += MP;
+                continue;
+            }
+            const int M = p.first - a < MP ? p.first - a : MP;
+            std::vector<int> pos(M);
+            for (int r = 0; r < M; ++r) pos[r] = a + r;
+            pf_inputs(P, M, p.prompt.data() + a, pos.data());
+            pf_enqueue(fabp, P, ls0, NL, M);
+            const auto t0 = std::chrono::steady_clock::now();
+            cp_pf_in();
+            pf_step(m, P, M, a + M, ls0, st);
+            cp_pf_out();
+            G6RT_CK(cudaStreamSynchronize(st));
+            const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+            ls0 += NL;
+            if (mtp)
+            {
+                pf_draft_inputs(DQ, M, p.prompt.data() + a + 1, pos.data());
+                pf_draft(D, DQ, P.x, M, a + M, st);
+                G6RT_CK(cudaStreamSynchronize(st));
+                if (const unsigned ae = attn_errors(D.d)) { fprintf(stderr, "g6m4: rank %d MTP layer attention error word %08x, seq %zu prefill rows %d..\n", R, ae, q, a); return 3; }
+            }
+            if (*fp.error || cp_pf_err()) { fprintf(stderr, "g6m4: rank %d prefill fabric error word %08x (CP staging %08x), seq %zu rows %d..\n", R, *fp.error, cp_pf_err(), q, a); return 3; }
+            if (const unsigned ae = attn_errors(m)) { fprintf(stderr, "g6m4: rank %d attention error word %08x, seq %zu prefill rows %d..\n", R, ae, q, a); return 3; }
+            printf("prefill rows %d..%d resid %016llx\n", a, a + M - 1, (unsigned long long)pf_hash(P, M));
+            fprintf(stderr, "# seq %zu prefill %d rows: %.3f ms (%.0f tok/s)\n", q, M, ms, M * 1000.0 / ms);
+            if (q > 0 || a > 0) { pf_ms += ms; pf_rows += M; }      // the very first sub-batch carries first-launch costs
+        }
+        // MTP after the prefill loop (as in m4sim): prompt rows past p.first go through mtp_sequence's prompt steps
+        if (mtp)
+        {
+            auto rm = [&](const StepIn& si, int s, double& ms) {
+                const int M = si.M;
+                *in = si;
+                std::vector<uint32_t> sizes(NC, (uint32_t)(M * HID * 2));
+                sizes[2 * NL] = (uint32_t)glue::head_bytes(M, nc);
+                fab.enqueue_step(si.step, sizes);
+                cp_enqueue(si.step, M, si.context);
+                const auto t0 = std::chrono::steady_clock::now();
+                if (graph) launch_main(bucket_of(m, si.context), M);
+                else launch_step(m, M, si.context, st);
+                G6RT_CK(cudaStreamSynchronize(st));
+                const double dt = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+                ms += dt;
+                if (*f.error || cp_error()) { fprintf(stderr, "g6m4: rank %d fabric error word %08x (CP %08x) at seq %zu step %d\n", R, *f.error, cp_error(), q, s); exit(3); }
+                const StepOut so = *out;
+                if (so.attn_err) { fprintf(stderr, "g6m4: rank %d attention error word %08x at seq %zu step %d\n", R, so.attn_err, q, s); exit(3); }
+                if (rlf) route_log_line(rlf, m, layers, q, s, M, si.pos[0], p.prompt.size());
+                std::string line;
+                step_line(m, so, s, M, line);
+                printf("%s\n", line.c_str());
+                if (top > 0) { std::string tl; top_lines(m, s, M, top, tl); fputs(tl.c_str(), stdout); }
+                fprintf(stderr, "# seq %zu step %d M %d: %.3f ms\n", q, s, M, dt);
+                return so;
+            };
+            auto rd = [&](const StepIn& di, bool chain, int s, double& ms) {
+                const int M = di.M;
+                *in_d = di;
+                std::vector<uint32_t> sizes(3, (uint32_t)(M * HID * 2));
+                sizes[2] = (uint32_t)glue::head_bytes(M, nc);
+                fabd.enqueue_step(di.step, sizes);
+                const auto t0 = std::chrono::steady_clock::now();
+                if (graph) G6RT_CK(cudaGraphLaunch(exec_d[bucket_of(D.d, di.context)][chain][M], st));
+                else launch_draft_step(D, M, di.context, chain, st);
+                G6RT_CK(cudaStreamSynchronize(st));
+                const double dt = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+                ms += dt;
+                if (*fd.error) { fprintf(stderr, "g6m4: rank %d draft fabric error word %08x at seq %zu step %d\n", R, *fd.error, q, s); exit(3); }
+                const StepOut so = *out_d;
+                if (so.attn_err) { fprintf(stderr, "g6m4: rank %d draft attention error word %08x at seq %zu step %d\n", R, so.attn_err, q, s); exit(3); }
+                std::string line;
+                const int t = step_line(D.d, so, s, M, line);
+                printf("%s%s\n", chain ? "chain" : "draft", line.c_str() + 4);
+                fprintf(stderr, "# seq %zu %s %d M %d: %.3f ms\n", q, chain ? "chain" : "draft", s, M, dt);
+                return t;
+            };
+            std::function<bool(const int*, int)> emit;
+            if (em.on) emit = [&](const int* t, int k) { pt.first_token(q); return em.push(t, k); };
+            pt.lap("pre_decode");
+            const std::vector<int> gen = mtp_sequence(p, mtp, step0, dstep, rm, rd, mtp_stats, mtp_steps, emit);
+            printf("generated");
+            for (int t : gen) printf(" %d", t);
+            printf("\n");
+            em.end(nullptr, mtp_stats.rounds, mtp, mtp_stats.tokens, mtp_stats.acc);
+            continue;
+        }
+        int last_tok = 0, ns_run = NS;
+        std::vector<int> gen;
+        for (int s = 0; s < NS; ++s)
+        {
+            const int M = step_rows(p, s);
+            *in = step_inputs(p, s, last_tok, step0);
+            std::vector<uint32_t> sizes(NC, (uint32_t)(M * HID * 2));
+            sizes[2 * NL] = (uint32_t)glue::head_bytes(M, nc);
+            fab.enqueue_step(in->step, sizes);
+            cp_enqueue(in->step, M, in->context);
+            dec_prof().on = getenv("G6_DEC_PROF") != nullptr && s > 0;      // the first step of a sequence carries first-launch costs
+            dec_prof().M = M; dec_prof().last = 0;
+            const auto t0 = std::chrono::steady_clock::now();
+            if (graph) launch_main(bucket_of(m, in->context), M);
+            else launch_step(m, M, in->context, st);
+            G6RT_CK(cudaStreamSynchronize(st));
+            const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+            if (dec_prof().on) ++dec_prof().steps[M];
+            dec_prof().on = false;
+            if (*f.error || cp_error()) { fprintf(stderr, "g6m4: rank %d fabric error word %08x (CP %08x) at seq %zu step %d\n", R, *f.error, cp_error(), q, s); return 3; }
+            const StepOut so = *out;
+            if (so.attn_err) { fprintf(stderr, "g6m4: rank %d attention error word %08x at seq %zu step %d\n", R, so.attn_err, q, s); return 3; }
+            std::string line;
+            last_tok = step_line(m, so, s, M, line);
+            printf("%s\n", line.c_str());
+            if (top > 0) { std::string tl; top_lines(m, s, M, top, tl); fputs(tl.c_str(), stdout); }
+            if (s >= PS - 1) gen.push_back(last_tok);
+            if (s >= PS - 1 && em.on) pt.first_token(q);
+            if (s >= PS - 1 && em.on && em.push(&last_tok, 1))
+            {
+                fprintf(stderr, "# seq %zu step %d M %d: %.3f ms\n", q, s, M, ms);
+                ns_run = s + 1;
+                break;
+            }
+            fprintf(stderr, "# seq %zu step %d M %d: %.3f ms\n", q, s, M, ms);
+            if (s >= PS + 2) t1.push_back(ms);
+        }
+        step0 += ns_run;
+        em.end(nullptr, 0, 0, 0, nullptr);
+        printf("generated");
+        for (int t : gen) printf(" %d", t);
+        printf("\n");
+    }
+    if (!t1.empty())
+    {
+        std::sort(t1.begin(), t1.end());
+        fprintf(stderr, "# rank %d: single-row step p50 %.3f ms min %.3f ms p90 %.3f ms over %zu steps, %d layers, %s\n", R,
+                t1[t1.size() / 2], t1[0], t1[t1.size() * 9 / 10], t1.size(), NL, graph ? "one graph" : "plain launches");
+    }
+    if (pf_rows) fprintf(stderr, "# rank %d: prefill %ld rows in %.1f ms = %.0f tok/s (sub-batches of %d, first one excluded), %d layers\n", R,
+                         pf_rows, pf_ms, pf_rows * 1000.0 / pf_ms, MP, NL);
+    if (mtp)
+    {
+        char tag[32];
+        snprintf(tag, sizeof tag, "rank %d", R);
+        mtp_stats.print(mtp, tag);
+        if (nc) fprintf(stderr, "# rank %d: top_p misses %u (target) %u (draft)\n", R, topp_misses(m), topp_misses(D.d));
+        fabd.wait_proxy_idle(); fabd.stop_proxy();
+    }
+    if (nc && !mtp) fprintf(stderr, "# rank %d: top_p misses %u\n", R, topp_misses(m));
+    if (two) { fabp2.wait_proxy_idle(); fabp2.stop_proxy(); }
+    if (MP) { fabp.wait_proxy_idle(); fabp.stop_proxy(); }
+#if defined(G6_CP) && G6_CP
+    if (cp_pf)
+    {
+        if (!fabs.wait_proxy_idle()) { fprintf(stderr, "g6m4: rank %d CP staging proxy drain failed (error word %08x)\n", R, cp_pf_err()); fabs.stop_proxy(); return 3; }
+        fabs.stop_proxy();
+        if (cp_pf_net(m).verify) printf("# rank %d: G6_CP_PF_VERIFY staged-page hash mismatches %llu\n", R, cp_pf_mismatches(m));
+    }
+#endif
+    if (pf_prof().on) pf_prof().print("this rank,");
+    if (rlf) fclose(rlf);
+    if (getenv("G6_DEC_PROF")) { char tag[32]; snprintf(tag, sizeof tag, "rank %d", R); dec_prof().print(tag, NL); }
+    fab.wait_proxy_idle();
+    fab.barrier();
+    fab.stop_proxy();
+    return 0;
+}

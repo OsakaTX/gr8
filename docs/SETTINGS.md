@@ -1,6 +1,7 @@
 # K1H2 settings
 
-`scripts/launch_tp6.sh` sets everything below. Every rank gets the same environment and flags, except `--rank`.
+`scripts/launch_tp6.sh` sets everything below (`scripts/launch_tp4.sh` sets the same, with a smaller `--cap`). Every
+rank gets the same environment and flags, except `--rank`.
 The source comments in `engine/runtime/` (`g6m4.cu`, `prefill.cuh`, `rank.cuh`) are the full reference. This file is
 the short version.
 
@@ -8,8 +9,8 @@ the short version.
 
 | flag | K1H2 value | meaning |
 |---|---|---|
-| `--rank R` | 0..5 | this process's rank; rank r loads `rank<r>.pack` |
-| `--ips a,..` / `--ips2 a,..` | from `cluster.env` | RoCE v2 address of every rank on rail 1 / rail 2, in rank order |
+| `--rank R` | 0..5 (TP4: 0..3) | this process's rank; rank r loads `rank<r>.pack` |
+| `--ips a,..` / `--ips2 a,..` | from `cluster.env` | RoCE v2 address of every rank on rail 1 / rail 2, in rank order (exactly `G6_NR` of them) |
 | `--proxy-cpu N` | 19 | CPU core for the fabric proxy thread (the CP fabric's proxy uses N-1) |
 | `--manifest` / `--pack` | `packs/rank<r>.*` | this rank's pack; `--pack -` reads it from stdin |
 | `--image` | on | load the whole pack into one device image (required for full packs) |

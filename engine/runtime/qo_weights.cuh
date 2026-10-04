@@ -1,8 +1,9 @@
 // G6_PF_OWN=3 full-head prefill weights (QO-INTEGRATION.md section 4): q_b and o_proj MXFP8 for all 64 heads, UK / UV
 // BF16 for all 64 heads, logical head order. Identical on every rank.
 //   qo_from_pack:  the names L%03d.qo.{q_b.mx.codes, q_b.mx.scales, o_proj.mx.codes, o_proj.mx.scales, kv_b.uk, kv_b.uv}
-//   qo_from_ranks: assembled on the device from the six ranks' head slices (m4sim holds all six packs). Rank r holds
-//                  head group g = (r - l % 6) mod 6 of layer l, heads QO_EDGES[g] .. QO_EDGES[g + 1] (attn/bind.cu).
+//   qo_from_ranks: assembled on the device from the NR ranks' head slices (m4sim holds all the packs). Rank r holds
+//                  head group g = (r - l % NR) mod NR of layer l, heads start(64, g) .. + width(64, g) (g6nr.h,
+//                  attn/bind.cu; TP6 edges 0, 11, 22, 33, 44, 54, 64).
 #pragma once
 #include "rank.cuh"
 #include "../attn/bind.h"
@@ -10,7 +11,6 @@
 namespace g6rt
 {
 
-constexpr int QO_EDGES[7] = {0, 11, 22, 33, 44, 54, 64};
 struct QoW
 {
     bind::Tensor qb_c, qb_s, o_c, o_s;   // [16384][2048], [16384][64], [6144][16384], [6144][512]
@@ -42,7 +42,7 @@ inline bool qo_from_pack(const Find& find, int l, QoW& w)
 // finds[r] = rank r's tensors. Device allocations are never freed (load-time, like the packs).
 inline QoW qo_from_ranks(const std::vector<Find>& finds, int l)
 {
-    if (finds.size() != 6) die("qo_from_ranks needs the six ranks' packs");
+    if (finds.size() != (size_t)g6nr::NR) die("qo_from_ranks needs every rank's pack");
     QoW w;
     auto alloc2 = [](bind::Tensor& t, long long a, long long b, size_t esz) {
         t.p = dmalloc<char>((size_t)a * b * esz); t.nd = 2; t.shape[0] = a; t.shape[1] = b;
@@ -54,9 +54,9 @@ inline QoW qo_from_ranks(const std::vector<Find>& finds, int l)
     alloc2(w.o_c, HID, 16384, 1); alloc2(w.o_s, HID, 512, 1);
     alloc3(w.uk, 64, 192, 512); alloc3(w.uv, 64, 256, 512);
     char n[80];
-    for (int g = 0; g < 6; ++g)
+    for (int g = 0; g < g6nr::NR; ++g)
     {
-        const int r = (g + l % 6) % 6, h0 = QO_EDGES[g], h = QO_EDGES[g + 1] - h0;
+        const int r = (g + l % g6nr::NR) % g6nr::NR, h0 = g6nr::start(g6nr::HEADS, g), h = g6nr::width(g6nr::HEADS, g);
         auto get = [&](const char* s) {
             snprintf(n, sizeof n, "L%03d.%s", l, s);
             TensorRef t = finds[r](n);

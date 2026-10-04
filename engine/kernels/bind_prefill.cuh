@@ -1248,7 +1248,7 @@ struct Expert
     // data
     const __half* x = nullptr;        // [M][ldx] mlp_norm output
     int ldx = 0;
-    __half* z1 = nullptr;             // [8M][EB blocks][gate, up][128] fp16 (EB = 3 for the TP6 packs)
+    __half* z1 = nullptr;             // [8M][EB blocks][gate, up][128] fp16 (EB = 3 for the TP6 packs, 4 for TP4)
     uint8_t* x2 = nullptr;            // [maxseg][MB][EB blocks][4][REC]  fc2 inputs, TR3 k order
     __half* yw = nullptr;             // [8M][6144] fp16 weighted expert output per route
     const __half* ysh = nullptr;      // [M][6144] fp16 shared expert output
@@ -1758,8 +1758,8 @@ __device__ __forceinline__ void fc1_body(const Expert& A, const long long* tr, i
 }
 
 // grid (2 EB = block * 2 + matrix, maxseg), block 256. EB = blocks per expert the scratch and grid are laid out for
-// (3 = the TP6 packs; every expert of the table must have tr[3] <= EB).
-template <int EB = 3>
+// (g6nr::EB: 3 = the TP6 packs, 4 = TP4; every expert of the table must have tr[3] <= EB).
+template <int EB = g6nr::EB>
 __global__ void __launch_bounds__(256, 2) k_pf_fc1(Expert A)
 {
     __shared__ __align__(16) unsigned char sA[4 * MB * REC];
@@ -1876,7 +1876,7 @@ __global__ void __launch_bounds__(512, 1) k_pf_fc1h(Expert A)
 
 // mid: warp = (route, block): g, u from z1 -> act -> rotated, quantized fc2 input record.
 // grid ceil(8M * EB / 8), block 256
-template <int EB = 3>
+template <int EB = g6nr::EB>
 __global__ void __launch_bounds__(256) k_pf_mid(Expert A)
 {
     const int lane = threadIdx.x & 31;
@@ -2083,7 +2083,7 @@ __device__ __forceinline__ void fc2_body(const Expert& A, const long long* tr, i
 }
 
 // grid (48, maxseg), block 256
-template <int EB = 3>
+template <int EB = g6nr::EB>
 __global__ void __launch_bounds__(256, 2) k_pf_fc2(Expert A)
 {
     __shared__ __align__(16) unsigned char sA[2 * MB * 4 * REC];
@@ -2278,7 +2278,7 @@ __device__ __forceinline__ void fc2_body_gl(const Expert& A, const long long* tr
 }
 
 // grid (48 / GL, maxseg), block 256
-template <int EB = 3>
+template <int EB = g6nr::EB>
 __global__ void __launch_bounds__(256, 2) k_pf_fc2g(Expert A)
 {
     __shared__ __align__(16) unsigned char sA[2 * MB * 4 * REC];
@@ -2329,22 +2329,22 @@ inline void launch_route(const Expert& A, cudaStream_t st)     // logits -> tok_
     k_pf_count<<<NEXP, 256, 0, st>>>(A);
     k_pf_fill<<<NEXP, 256, 0, st>>>(A);
 }
-// EB: blocks per expert of the scratch layout (scratch_bytes / scratch_at with the same eb); 3 = the TP6 packs
+// EB: blocks per expert of the scratch layout (scratch_bytes / scratch_at with the same eb); g6nr::EB = 3 (TP6) / 4 (TP4)
 #ifdef PF_HOIST
-template <int EB = 3> inline void launch_fc1(const Expert& A, cudaStream_t st)
+template <int EB = g6nr::EB> inline void launch_fc1(const Expert& A, cudaStream_t st)
 {
     static bool attr = false;
     if (!attr) { cudaFuncSetAttribute(k_pf_fc1h<EB>, cudaFuncAttributeMaxDynamicSharedMemorySize, FC1H_SMEM); attr = true; }
     if (A.on) k_pf_fc1h<EB><<<dim3(2 * fc1h_pairs(EB), A.maxseg), 512, FC1H_SMEM, st>>>(A);
 }
 #else
-template <int EB = 3> inline void launch_fc1(const Expert& A, cudaStream_t st) { if (A.on) k_pf_fc1<EB><<<dim3(2 * EB, A.maxseg), 256, 0, st>>>(A); }
+template <int EB = g6nr::EB> inline void launch_fc1(const Expert& A, cudaStream_t st) { if (A.on) k_pf_fc1<EB><<<dim3(2 * EB, A.maxseg), 256, 0, st>>>(A); }
 #endif
-template <int EB = 3> inline void launch_mid(const Expert& A, cudaStream_t st) { if (A.on) k_pf_mid<EB><<<(A.M * TOPK * EB + 7) / 8, 256, 0, st>>>(A); }
+template <int EB = g6nr::EB> inline void launch_mid(const Expert& A, cudaStream_t st) { if (A.on) k_pf_mid<EB><<<(A.M * TOPK * EB + 7) / 8, 256, 0, st>>>(A); }
 #ifdef PF_FC2GL
-template <int EB = 3> inline void launch_fc2(const Expert& A, cudaStream_t st) { if (A.on) k_pf_fc2g<EB><<<dim3(HID / 128 / FC2GL, A.maxseg), 256, 0, st>>>(A); }
+template <int EB = g6nr::EB> inline void launch_fc2(const Expert& A, cudaStream_t st) { if (A.on) k_pf_fc2g<EB><<<dim3(HID / 128 / FC2GL, A.maxseg), 256, 0, st>>>(A); }
 #else
-template <int EB = 3> inline void launch_fc2(const Expert& A, cudaStream_t st) { if (A.on) k_pf_fc2<EB><<<dim3(HID / 128, A.maxseg), 256, 0, st>>>(A); }
+template <int EB = g6nr::EB> inline void launch_fc2(const Expert& A, cudaStream_t st) { if (A.on) k_pf_fc2<EB><<<dim3(HID / 128, A.maxseg), 256, 0, st>>>(A); }
 #endif
 inline void launch_fin(const Expert& A, cudaStream_t st)
 {
@@ -2352,7 +2352,7 @@ inline void launch_fin(const Expert& A, cudaStream_t st)
     if (A.rs.base) k_pf_fin<true><<<A.M, 256, 0, st>>>(A);
     else k_pf_fin<<<A.M, 256, 0, st>>>(A);
 }
-template <int EB = 3> inline void launch_experts(const Expert& A, cudaStream_t st)
+template <int EB = g6nr::EB> inline void launch_experts(const Expert& A, cudaStream_t st)
 {
     launch_route(A, st);
     launch_fc1<EB>(A, st);
@@ -2366,7 +2366,7 @@ struct Scratch
 {
     int Mmax = 0;
     uint8_t* x8_big;                  // MXFP8 records of a 6144-wide input (x, then x2)
-    uint8_t* x8_small;                // same, up to 2816 wide (q_a_norm output, attention output, MLP activation)
+    uint8_t* x8_small;                // same, up to SMALLW wide (q_a_norm output, attention output, MLP activation; 2816 / 4096)
     uint16_t* xb;                     // [M][6144] BF16 copy of x / x2
     float* y32;                       // [M][256] fp32 staging of idx.wk / idx.weights_proj
     __half *g, *u, *act;              // [M][2048] shared / dense gate, up, activation
@@ -2378,7 +2378,7 @@ struct Scratch
     __half* yw;
 };
 
-inline size_t scratch_layout(Scratch* s, char* base, int M, int eb = 3)     // eb = blocks per expert (EB of the launches)
+inline size_t scratch_layout(Scratch* s, char* base, int M, int eb = g6nr::EB)     // eb = blocks per expert (EB of the launches)
 {
     size_t o = 0;
     auto take = [&](size_t bytes) { char* p = base ? base + o : nullptr; o += (bytes + 255) / 256 * 256; return p; };
@@ -2386,7 +2386,7 @@ inline size_t scratch_layout(Scratch* s, char* base, int M, int eb = 3)     // e
     Scratch t;
     t.Mmax = M;
     t.x8_big = reinterpret_cast<uint8_t*>(take(RB * (HID / 32) * REC));
-    t.x8_small = reinterpret_cast<uint8_t*>(take(RB * (2816 / 32) * REC));
+    t.x8_small = reinterpret_cast<uint8_t*>(take(RB * (g6nr::SMALLW / 32) * REC));
     t.xb = reinterpret_cast<uint16_t*>(take(m * HID * 2));
     t.y32 = reinterpret_cast<float*>(take(m * 256 * 4));
     t.g = reinterpret_cast<__half*>(take(m * SACTW * 2));
@@ -2410,8 +2410,8 @@ inline size_t scratch_layout(Scratch* s, char* base, int M, int eb = 3)     // e
     return o;
 }
 // One block per rank for prefill sub-batches of up to Mmax rows: about 161 KB per row + 6.6 MB (1024 rows: 172 MB).
-inline size_t scratch_bytes(int Mmax, int eb = 3) { return scratch_layout(nullptr, nullptr, Mmax, eb); }
-inline Scratch scratch_at(void* block, int Mmax, int eb = 3)
+inline size_t scratch_bytes(int Mmax, int eb = g6nr::EB) { return scratch_layout(nullptr, nullptr, Mmax, eb); }
+inline Scratch scratch_at(void* block, int Mmax, int eb = g6nr::EB)
 {
     Scratch s;
     scratch_layout(&s, static_cast<char*>(block), Mmax, eb);
@@ -2468,8 +2468,9 @@ inline const char* make_layer(const Tensors& T, int M, const Scratch& sc, const 
     if ((e = make_gemm(T.t[DT],         T.s[DT],         M, sc.x8_small, L.moe ? static_cast<void*>(sc.ysh) : static_cast<void*>(io.mlp_part), !L.moe, L.down))) return e;
     if (!L.q_a.on || !L.kv_a.on || !L.q_b.on || !L.o_proj.on) return "layer without q_a / kv_a / q_b / o_proj .mx.codes";
     if (!L.gate.on || !L.up.on || !L.down.on) return L.moe ? "MoE layer without shared.gate/up/down.mx" : "layer has neither tr3.table nor dense.gate/up/down.mx";
-    if (L.q_a.K != HID || L.kv_a.K != HID || L.q_a.N > 2816 || L.q_b.K != L.q_a.N || L.o_proj.N != HID || L.o_proj.K != L.q_b.N || L.q_b.N % 256 || L.q_b.N > 2816)
-        return "attention projection shapes do not chain (q_a -> q_b, q_b width = o_proj K <= 2816)";
+    if (L.q_a.K != HID || L.kv_a.K != HID || L.q_a.N > g6nr::SMALLW || L.q_b.K != L.q_a.N || L.o_proj.N != HID || L.o_proj.K != L.q_b.N || L.q_b.N % 256 ||
+        L.q_b.N > g6nr::QBW)
+        return "attention projection shapes do not chain (q_a -> q_b, q_b width = o_proj K <= QBW)";
     if (L.indexer && L.idx_q.K != L.q_a.N) return "idx.wq_b input width is not the q_a width";
     L.heads = L.q_b.N / 256;
     L.inter = L.gate.N;

@@ -1,5 +1,5 @@
 #!/bin/bash
-# Stop the front end, the shim and all six engine ranks started by launch_tp6.sh.
+# Stop the front end, the shim and every engine rank (six or four) started by launch_tp6.sh / launch_tp4.sh.
 set -u
 . "$(dirname "$0")/common.sh"
 for p in front shim; do [ -f "$G6_HOME/out/$p.pid" ] && kill "$(cat "$G6_HOME/out/$p.pid")" 2>/dev/null; done

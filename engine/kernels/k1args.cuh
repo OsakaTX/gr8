@@ -6,8 +6,8 @@
 #endif
 
 constexpr int SMAX = 72;       // max distinct experts per step (slot SMAX = shared expert)
-constexpr int ACTW = 384;      // max intermediate columns per rank, routed experts
-constexpr int SACTW = 2048;    // same for the shared expert / dense MLP slot (dense layers 0..2: 2048 per rank)
+constexpr int ACTW = g6nr::EB * 128;   // max intermediate columns per rank, routed experts: 384 (TP6) / 512 (TP4)
+constexpr int SACTW = g6nr::DENSE_CH;  // same for the shared expert / dense MLP slot (dense layers 0..2): 2048 / 3072
 constexpr int GPMAX = 16;      // max k-split partials per (block, matrix) in TR3 fc1
 
 struct K1Args
@@ -25,7 +25,8 @@ struct K1Args
     int n_slots, M;            // n_slots = slots the grids are launched for (>= n_slots_dev of every plan)
     const int* n_slots_dev;    // [NP] distinct routed experts of the plan (RoutePlan::n_slots); CTAs of slots beyond it exit
 
-    // routed experts, TR3 block records (converter pack layout); an expert has 2 or 3 blocks of K3 or K4 on a rank
+    // routed experts, TR3 block records (converter pack layout); an expert has 2 or 3 blocks (TP6) or 4 (TP4) of K3 or K4
+    // on a rank
     const long long* t_tab;    // [E][6] fc1 byte offset, fc2 byte offset, first block row (v1/v2/v3), n blocks, bits, first block
     const uint8_t* t_fc1;      // at tab[0]: [n blocks][2][384][8][TB], TB = 32*bits
     int t_wide;                // K3 experts of t_fc1 are in the wide order (tr3_wide.cuh, k_tr3_widen ran on it)
@@ -68,4 +69,5 @@ struct K1Args
 #else
 #define K1_OUT(A) ((A).out)
 #endif
-constexpr int FCTL_N = 3 + SMAX * 3;   // [0] work item counter, [1 + slot*B + b] fc1 units done, [1 + SMAX*3] shared fc1 CTAs done, [2 + SMAX*3] CTAs left
+// [0] work item counter, [1 + slot*B + b] fc1 units done, [1 + SMAX*EB] shared fc1 CTAs done, [2 + SMAX*EB] CTAs left
+constexpr int FCTL_N = 3 + SMAX * g6nr::EB;

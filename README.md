@@ -17,7 +17,7 @@
 >   - one request at a time (multi-session is in progress)
 >   - decode slows past the replicated context window (being worked on)
 >   - launch scripts not yet run outside our own setup
->   - no 4-Spark version yet
+>   - the 4-Spark (TP4) version runs without the QO prefill path, so its prefill is slower (see Known limits)
 > - **Where help would be great:**
 >   - multi-session at long context
 >   - decode cost with context split across nodes
@@ -147,17 +147,19 @@ pack format, serve loop, front end shape). Use it as the map for porting another
 | item | status |
 |---|---|
 | engine source = what we serve | The tree is our K1H2 source with only comments edited. `scripts/build.sh`'s flags built on a GB10 (exit 0, no errors) and gave SASS identical to our served binary, except two compiler-generated anonymous-namespace names. |
-| `launch_tp6.sh` / `stop.sh` / `stage.sh` | Run end to end with a fake engine (`frontend/tests/fake_serve_engine.py`) standing in for six ranks on one host: all ranks ready, a chat request streamed, stop left no processes. **Not yet run against the real engine on six Sparks.** Our own boots use an older harness with the same env and args. |
+| `launch_tp6.sh` / `stop.sh` / `stage.sh` | Run end to end with a fake engine (`frontend/tests/fake_serve_engine.py`) standing in for six ranks on one host: all ranks ready, a chat request streamed, stop left no processes. **Not yet run against the real engine on six Sparks.** Our own boots use an older harness with the same env and args. `launch_tp4.sh` / `stop.sh` were run against the real engine on four Sparks (#2). |
 | `build_packs.sh` | The six GPTQ input dirs on Hugging Face match the layer-000 hashes our converter expects. The full conversion was **not** re-run from these scripts. Our packs came from the same `convert.py` + `qopack.py` with the same inputs, but we did not record which revision of the TR3 repo we downloaded. Run `checkpack.py` (the script does) and, if you can, compare outputs against ours. |
 | quality | Each boot checks that all six ranks produce identical tokens. K1H2's output was token-identical to the same build with the old page hash, at 131K and 254K prompts. A full KL / GSM8K / HumanEval gate on K1H2 is not reported here. |
 
 ## Known limits
 
 - **One request at a time.** The shim queues the rest. There is no batching across requests.
-- Exactly six ranks. The rank map (`tools/convert/plan.py`) and the kernels' splits are fixed at TP6. A TP4 (4-Spark) build of
-  this engine exists on our side, but its pack build and launch are not scripted yet, so it is not in this snapshot.
+- Six ranks (TP6) or four (TP4). TP4: `G6_NR=4 scripts/build.sh`, `scripts/build_packs.sh` with the TP4 GPTQ codes
+  (`tp4/r0..r3`), `scripts/stage.sh`, `scripts/launch_tp4.sh`. A TP4 rank pack is about 90 GB, so the 13 GB QO pack
+  does not fit next to it: TP4 runs `G6_PF_OWN=1` (row-owner projections, no QO attention) with a 393,216-token pool.
+  First TP4 numbers (one boot, 2200 MHz cap): 8K prefill 816 tok/s, 32K 654 tok/s, prose decode 29.0 tok/s, 87K needle found.
 - `logprobs` are refused. `top_k`/`min_p` are ignored with a warning. The full list is in `frontend/README.md`.
-- Requests are passed to ranks 1-5 as files over ssh (one persistent connection per node), which adds a little TTFT.
+- Requests are passed to the ranks other than 0 as files over ssh (one persistent connection per node), which adds a little TTFT.
 - With hashing on, boot takes a few minutes. It is mostly pack read speed: local packs loaded at about 1.8 GB/s per node
   for us.
 - If a rank dies, the whole engine stops. Restart with `scripts/stop.sh && scripts/launch_tp6.sh`.

@@ -1,7 +1,10 @@
-"""g6 weight converter: TR3 checkpoint + six old-rank D8 GPTQ dirs -> per-rank packs (SPEC §2, §7, §9).
+"""g6 weight converter: TR3 checkpoint + the old-rank D8 GPTQ dirs -> per-rank packs (SPEC §2, §7, §9).
 
 python3 -m tools.convert.convert --tr3 DIR --d8 R0 R1 R2 R3 R4 R5 --out DIR [--layers 0,3,40,77,78]
         [--ranks 0,1,2,3,4,5] [--skip embed,head] [--drop-cache]
+
+The number of --d8 dirs sets the rank count: six (TP6, the default build) or four (TP4, an engine built with
+-DG6_NR=4). The GPTQ codes are solved per rank slice, so TP4 needs the TP4 codes (tp4/r0..r3), not the TP6 ones.
 
 Nothing is re-quantized except the D2 MXFP8 copies, which are produced from the original BF16 tensors with the
 same deterministic equation D2 runs at boot (tools/convert/mxfp8.py). TR3 trellis/suh/svh bytes and D8 q4 codes
@@ -48,7 +51,7 @@ def _check_zero_pad(q, s, what):
 
 
 def d8_global(d8, l, module):
-    """Reassemble the logical (unpadded) q4/s4 of one D8 module from the six old ranks' files."""
+    """Reassemble the logical (unpadded) q4/s4 of one D8 module from the old ranks' files (six or four)."""
     name = f'model.layers.{l}.{module}'
     qs = [(f.get(name + '.q4'), f.get(name + '.s4')) for f in d8]
     if module.endswith('fused_qkv_a_proj'):
@@ -336,21 +339,29 @@ def convert_head(src_head, writers):
 def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument('--tr3', required=True, help='TR3 checkpoint dir (model-layer-NNN / model-embed / model-head)')
-    ap.add_argument('--d8', nargs=6, required=True, help='old D8 gptq-w32 dirs in old-rank order r0..r5')
+    ap.add_argument('--d8', nargs='+', required=True,
+                    help='old D8 gptq-w32 dirs in old-rank order: six (r0..r5, TP6) or four (r0..r3, TP4)')
     ap.add_argument('--out', required=True)
     ap.add_argument('--layers', default='all')
-    ap.add_argument('--ranks', default='0,1,2,3,4,5')
+    ap.add_argument('--ranks', default='all')
     ap.add_argument('--skip', default='', help='comma list of globals to leave out: embed, head')
     ap.add_argument('--drop-cache', action='store_true', help='fdatasync + FADV_DONTNEED written and read pages')
     ap.add_argument('--gv-records', action='store_true', help='add .mx.gv / .gv GEMV record tensors (densev.cuh)')
     a = ap.parse_args(argv)
+    if len(a.d8) not in (4, 6):
+        ap.error(f'--d8 takes six dirs (TP6) or four (TP4), got {len(a.d8)}')
+    plan.set_nr(len(a.d8))
     global GV
     GV = a.gv_records
     layers = list(range(plan.L_MTP + 1)) if a.layers == 'all' else [int(x) for x in a.layers.split(',')]
-    ranks = [int(x) for x in a.ranks.split(',')]
+    ranks = list(range(plan.NR)) if a.ranks == 'all' else [int(x) for x in a.ranks.split(',')]
+    if any(r < 0 or r >= plan.NR for r in ranks):
+        ap.error(f'--ranks must be 0..{plan.NR - 1}')
     os.makedirs(a.out, exist_ok=True)
     skip = set(filter(None, a.skip.split(',')))
     meta = dict(converter=VERSION, layers=layers, globals=sorted({'embed', 'head'} - skip), spec='SPEC.md §9 rank map')
+    if plan.NR != 6:
+        meta['nr'] = plan.NR   # TP6 manifests stay as they were
     if GV:
         meta['gv_records'] = True
     writers = {r: PackWriter(os.path.join(a.out, f'rank{r}.pack'), r, a.drop_cache, meta) for r in ranks}

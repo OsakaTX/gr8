@@ -1,7 +1,10 @@
 #!/bin/bash
-# Build the K1H2 engine (g6m4 = one rank on the real fabric, m4sim = one GPU simulating six ranks) on ONE Spark.
+# Build the K1H2 engine (g6m4 = one rank on the real fabric, m4sim = one GPU simulating all NR ranks) on ONE Spark.
 # Needs CUDA 13 (nvcc with sm_121a), g++ with C++20, libibverbs-dev, cuBLAS. A few minutes on a GB10, CPU only.
 #   scripts/build.sh [OUT_DIR]            default OUT_DIR = ./bin
+#   G6_NR=4 scripts/build.sh bin4         the TP4 engine (four Sparks, packs from build_packs.sh with the TP4 codes)
+#   BUNDLE_LIBS=1                         also copy cuBLAS (libcublas, libcublasLt) into OUT_DIR/lib, for nodes
+#                                         without the CUDA toolkit (stage.sh copies it, launch_tp4.sh uses it)
 # These -D flags are the K1H2 build; every one of them is an engine path that our A/B tests promoted
 # (see docs/SETTINGS.md). Dropping one builds an older, slower or less-checked path, not a broken one.
 set -eu
@@ -11,6 +14,10 @@ K1H2_FLAGS="-DPF_FC2GL=6 -DPF_GEMMF=1 -DPF_XQ8C=1 -DPF_RNWIDE=1 -DPF_GEMMR=1 -DP
 -DDEC_SLOT=2 -DDEC_CPB=1 -DDEC_AVP=1 -DPF_QOROPE=1 -DPF_ISGRT=1 -DPF_ROPE2=1 -DDEC_CPB2=64 -DDEC_I4PAIR=1 -DSEL32 \
 -DG6_CP=1 -DG6_CP_PF_HASH2=1"
 cd "$REPO/engine/runtime"
-EXTRA="$K1H2_FLAGS ${EXTRA:-}" OUT="$OUT" bash build_m4.sh "${ARCH:-121a}" all
+EXTRA="$K1H2_FLAGS ${G6_NR:+-DG6_NR=$G6_NR} ${EXTRA:-}" OUT="$OUT" bash build_m4.sh "${ARCH:-121a}" all
+if [ "${BUNDLE_LIBS:-0}" = 1 ]; then
+  mkdir -p "$OUT/lib"
+  cp -L /usr/local/cuda/lib64/libcublas.so.13 /usr/local/cuda/lib64/libcublasLt.so.13 "$OUT/lib/"
+fi
 strings "$OUT/g6m4" | grep -q "G6_CP_PF_HASH2 build" && echo "HASH2 build marker: present"
 md5sum "$OUT/g6m4" "$OUT/m4sim"

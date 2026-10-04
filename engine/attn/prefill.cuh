@@ -270,8 +270,8 @@ static int create_state(G6AttnPrefill** out,G6AttnBinding* b,void* s,G6AttnPrefi
         p->workspace=w;w->refs.fetch_add(1,std::memory_order_relaxed);
     }else{
         auto w=new G6AttnPrefillScratch;p->workspace=w;
-        // A shared root is max H11/full even if its first layer is H10/reuse.
-        G6AttnPrefill plan=*p;if(shared){plan.H=11;plan.full_index=true;}
+        // A shared root is max HMAX/full (H11 at TP6) even if its first layer is HMIN/reuse.
+        G6AttnPrefill plan=*p;if(shared){plan.H=g6nr::HMAX;plan.full_index=true;}
         w->bytes=scratch_layout(plan,b->args,nullptr);w->H=plan.H;w->full_index=plan.full_index;w->cap=p->cap;w->maxrows=p->maxrows;w->R=p->R;w->dense_limit=p->dense_limit;w->device=device;
         e=cudaMalloc(&w->data,w->bytes);if(e!=cudaSuccess){delete w;delete p;return int(e);}
         int rc=blas_status(cublasCreate(&w->blas));if(!rc)rc=blas_status(cublasSetMathMode(w->blas,CUBLAS_MATH_DISALLOW_REDUCED_PRECISION_REDUCTION));

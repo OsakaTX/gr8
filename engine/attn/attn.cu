@@ -1,6 +1,8 @@
 // Independently written g6 paged sparse MLA + indexer. No inference-engine code.
 #include "attn.h"
 #include "replay.h"
+#include "../g6nr.h"
+#include "../h2d.h"
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
@@ -317,7 +319,7 @@ struct Work {
     float *q,*rope,*weights,*si,*so,*prob,*parts,*context;
     half* iq;int *ii,*io,*offsets;uint64_t* selected;SelectionState* selection;int* histogram;void* temp;size_t temp_bytes,total;
 };
-static bool valid(const G6Attn& a){return a.rows>0&&(a.heads==10||a.heads==11)&&a.context>0&&a.page_size>0&&!(a.page_size&(a.page_size-1))&&a.page_count>0&&a.table_size>0&&a.query_tile>0&&a.query_tile<=64&&a.context<=INT_MAX/a.query_tile;}
+static bool valid(const G6Attn& a){return a.rows>0&&(a.heads==g6nr::HMIN||a.heads==g6nr::HMAX)&&a.context>0&&a.page_size>0&&!(a.page_size&(a.page_size-1))&&a.page_count>0&&a.table_size>0&&a.query_tile>0&&a.query_tile<=64&&a.context<=INT_MAX/a.query_tile;}
 static Work workspace(const G6Attn& a,void* base){
     Work w{};size_t n=0;const size_t R=std::min(a.rows,a.query_tile),H=a.heads,T=a.context;
     auto alloc=[&](size_t bytes){size_t old=n;n=(n+bytes+255)&~size_t(255);return (void*)((uintptr_t)base+old);};

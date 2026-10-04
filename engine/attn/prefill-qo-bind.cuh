@@ -110,7 +110,7 @@ inline void qo_dump(const __half* q, int rows, int context, cudaStream_t st) {
     static const bool dump = std::getenv("G6_QO_DUMP") != nullptr, inj = std::getenv("G6_QO_NANINJ") != nullptr;
     static std::atomic<int> injected{0};
     if (inj) {
-        static const unsigned short nan = 0x7E00; cudaMemcpyAsync((void*)q, &nan, 2, cudaMemcpyHostToDevice, st); cudaStreamSynchronize(st);
+        static const unsigned short nan = 0x7E00; g6h2d::copy((void*)q, &nan, 2, st);   // pageable source: pinned staging (h2d.h)
         if (injected.exchange(1) == 0) fprintf(stderr, "qodump NaN injected into q[0] (every call)\n");
     }
     if (!dump) return;
@@ -184,9 +184,12 @@ extern "C" int g6_attn_qo_create(G6AttnQo** out, const G6AttnBinding* b, const G
 #if PF_ROPE2
     if (!owner) {                                   // attn.cu decode/prefill kernels read the same table (ga::cs_t)
         const float2* t = p->rope; const int c = p->cap;
-        cudaMemcpyToSymbolAsync(ga::g_rope, &t, sizeof t, 0, cudaMemcpyHostToDevice, st);
-        cudaMemcpyToSymbolAsync(ga::g_rope_cap, &c, sizeof c, 0, cudaMemcpyHostToDevice, st);
-        cudaStreamSynchronize(st);
+        void *at = nullptr, *ac = nullptr;     // pageable sources: pinned staging (h2d.h)
+        e = cudaGetSymbolAddress(&at, ga::g_rope);
+        if (e == cudaSuccess) e = cudaGetSymbolAddress(&ac, ga::g_rope_cap);
+        if (e == cudaSuccess) e = g6h2d::copy(at, &t, sizeof t, st);
+        if (e == cudaSuccess) e = g6h2d::copy(ac, &c, sizeof c, st);
+        if (e != cudaSuccess) { cudaFree(p->storage); gqi::release_work(p->w); delete p; return int(e); }
     }
 #endif
 #ifdef PF_QODUMP

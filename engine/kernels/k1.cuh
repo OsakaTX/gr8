@@ -104,7 +104,7 @@ __global__ __launch_bounds__(512) void k1_tr3_fused(K1Args A)
     const int u2 = A.B * A.NS2, n2 = A.n_slots * u2;                    // fc2 units per slot, routed fc2 items
     const int total = n1 + sh1 + n2 + A.s_ns2;
     int* done = A.fctl + 1;
-    int* sdone = A.fctl + 1 + SMAX * 3;
+    int* sdone = A.fctl + 1 + SMAX * g6nr::EB;
     if (blockIdx.x == 0 && t == 0) A.ctl[2] = plan;
     for (;;)
     {

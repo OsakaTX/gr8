@@ -1,19 +1,44 @@
 """SPEC §9 rank ownership map + per-rank pack sizes. The one place the converter reads ownership from.
 
-Ranks r = 0..5 are g6 ranks. For each rule "rank order rho_j = (j + off) % 6, widths w_j assigned contiguously
-in that order", rank r = rho_j holds chunk j, with j = (r - off) % 6.
+Ranks r = 0..NR-1 are g6 ranks. For each rule "rank order rho_j = (j + off) % NR, widths w_j assigned contiguously
+in that order", rank r = rho_j holds chunk j, with j = (r - off) % NR.
+
+NR is 6 (TP6) unless set_nr() picks another count. The widths split n units the way engine/g6nr.h does: the larger
+chunks first, n // NR + (j < n % NR). TP6: heads (11,11,11,11,10,10), expert blocks (3,3,3,3,2,2), vocab tiles
+(202,202,202,202,201,201), dense groups 64 each. TP4: heads 16, expert blocks 4, vocab tiles (303,303,302,302),
+dense groups 96 (3072 channels).
 """
 import numpy as np
 
-NR = 6
 H = 6144
 L_MAIN = 78          # backbone layers 0..77
 L_MTP = 78
 N_EXP = 256
-W6 = (11, 11, 11, 11, 10, 10)          # heads / shared-expert groups
-WB = (3, 3, 3, 3, 2, 2)                # expert 128-blocks
-VOCAB_TILES = (202, 202, 202, 202, 201, 201)
+N_HEADS = 64         # attention heads = shared-expert g32 groups (I = 2048)
+N_BLOCKS = 16        # 128-column blocks of a routed expert (I = 2048)
+N_VTILES = 1210      # 128-row lm_head tiles
+N_DENSE_G = 384      # g32 groups of the dense MLP (I = 12288)
 VOCAB = 154880
+
+
+def widths(n, nr):
+    """n units over nr ranks, as engine/g6nr.h width(): the larger chunks first."""
+    return tuple(n // nr + (1 if j < n % nr else 0) for j in range(nr))
+
+
+def set_nr(nr):
+    """Pick the rank count. The engine build must match (-DG6_NR=nr)."""
+    global NR, W_HEADS, WB, VOCAB_TILES, W_DENSE
+    if nr != 6 and (nr <= 0 or 64 % nr):
+        raise ValueError(f'rank count {nr}: 6 or a divisor of 64 (engine/g6nr.h)')
+    NR = nr
+    W_HEADS = widths(N_HEADS, nr)        # heads / shared-expert groups
+    WB = widths(N_BLOCKS, nr)            # expert 128-blocks
+    VOCAB_TILES = widths(N_VTILES, nr)
+    W_DENSE = widths(N_DENSE_G, nr)
+
+
+set_nr(6)
 
 
 def _chunks(widths, off):
@@ -29,17 +54,17 @@ def expert_blocks(l, e):
 
 def heads(l):
     """rank -> (first head, n heads) of the 64 attention heads."""
-    return _chunks(W6, l)
+    return _chunks(W_HEADS, l)
 
 
 def shared_groups(l):
     """rank -> (first g32 group, n groups) of the shared expert's 64 intermediate groups (I=2048)."""
-    return _chunks(W6, l)
+    return _chunks(W_HEADS, l)
 
 
 def dense_groups(l):
-    """rank -> (first g32 group, n groups) of the dense MLP's 384 groups (I=12288), 64 per rank."""
-    return _chunks((64,) * NR, l)
+    """rank -> (first g32 group, n groups) of the dense MLP's 384 groups (I=12288): 64 per rank at TP6, 96 at TP4."""
+    return _chunks(W_DENSE, l)
 
 
 def vocab_rows(r):
@@ -98,8 +123,9 @@ def rank_bytes(r, bits_of):
                 add('tr3_codes', nb * 9216 * 32 * bits[e])
                 add('tr3_vectors', nb * (2 * H + 3 * 128 + H) * 2)
         else:
-            add('gptq_dense', 3 * _gq(H, 2048))
-            add('mxfp8_dense', 3 * _mx(H, 2048))
+            nd = dense_groups(l)[r][1] * 32
+            add('gptq_dense', 3 * _gq(H, nd))
+            add('mxfp8_dense', 3 * _mx(H, nd))
         if mtp:
             add('mxfp8_mtp_eh', _mx(H, 2 * H))
             add('bf16_norms', 3 * 2 * H)
@@ -112,6 +138,8 @@ def rank_bytes(r, bits_of):
 if __name__ == '__main__':
     import json
     import sys
+    if len(sys.argv) > 2:
+        set_nr(int(sys.argv[2]))
     tb = json.load(open(sys.argv[1]))
     bits_of = lambda l: tb[str(l)]['k']
     rows = [rank_bytes(r, bits_of) for r in range(NR)]

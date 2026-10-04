@@ -1,12 +1,12 @@
 // g6 rank step: one rank's decode step over a list of real layers + head, as launch helpers.
-// Used unchanged by the six-process runtime (engine/runtime/g6m4.cu, real fabric) and by the one-process
-// six-simulated-rank driver (engine/runtime/m4sim.cu, loopback fabric), so their outputs must be bit-identical.
+// Used unchanged by the NR-process runtime (engine/runtime/g6m4.cu, real fabric; NR = G6_NR, six or four) and by the
+// one-process NR-simulated-rank driver (engine/runtime/m4sim.cu, loopback fabric), so their outputs must be bit-identical.
 //
 // Step, M rows of one sequence at consecutive positions (RUNTIME.md §4), collective c = 2*i for layer i's attention
 // partial, 2*i+1 for its MLP partial, 2*NL for the head all-gather:
 //   launch_embed
 //   per layer i:  launch_attn_block (projections, attention, o_proj, partial -> send slot, doorbell)
-//                 launch_consume(2i, mlp_norm)          wait for the peers, residual += six partials, norm
+//                 launch_consume(2i, mlp_norm)          wait for the peers, residual += NR partials, norm
 //                 launch_mlp_block  (router, plan, experts + shared / dense MLP, partial -> send slot, doorbell)
 //                 launch_consume(2i+1, next norm)
 //   launch_head_local (lm_head slice, local argmax / LSE / Gumbel record -> send slot, doorbell), launch_head_merge
@@ -29,6 +29,7 @@
 #include <string>
 #include <vector>
 #include "draft_shape.h"
+#include "../h2d.h"
 #include "../kernels/glue.cuh"
 #include "../kernels/bind.cuh"
 #include "../attn/bind.h"
@@ -331,7 +332,7 @@ inline void build(Model& m, int rank, const std::vector<int>& ids, const Find& f
     m.q_a = dmalloc<__half>((size_t)MX * QA);
     m.q_a_n = dmalloc<__half>((size_t)MX * QA);
     m.kv_a = dmalloc<__half>((size_t)MX * KVA);
-    m.q_b = dmalloc<__half>((size_t)MX * 11 * 256);
+    m.q_b = dmalloc<__half>((size_t)MX * g6nr::QBW);
     m.idx_q = dmalloc<__half>((size_t)MX * IDXQ);
     m.idx_k = dmalloc<__half>((size_t)MX * IDXK);
     m.idx_w = dmalloc<__half>((size_t)MX * IDXW);
@@ -369,8 +370,8 @@ inline void build(Model& m, int rank, const std::vector<int>& ids, const Find& f
         const char* e = getenv("G6_DEC_SHARED_SCRATCH");
         if (e && atoi(e) == 1 && !(m.nl == 1 && ids[0] == 78))
         {
-            m.dscratch_bytes = std::max(g6_attn_bind_scratch_need(10, cap_ab, attn_rows, 16),
-                                        g6_attn_bind_scratch_need(11, cap_ab, attn_rows, 16));
+            m.dscratch_bytes = std::max(g6_attn_bind_scratch_need(g6nr::HMIN, cap_ab, attn_rows, 16),
+                                        g6_attn_bind_scratch_need(g6nr::HMAX, cap_ab, attn_rows, 16));
             if (!m.dscratch_bytes) die("G6_DEC_SHARED_SCRATCH: bad attention shape");
             m.dscratch = dmalloc<char>(m.dscratch_bytes);     // zeroed
         }
@@ -426,8 +427,8 @@ inline void build(Model& m, int rank, const std::vector<int>& ids, const Find& f
         std::vector<int> sh(m.nl);
         std::vector<unsigned*> er(m.nl);
         for (int i = 0; i < m.nl; ++i) { sh[i] = !m.layers[i].indexer; er[i] = m.layers[i].ab.args.error; }
-        G6RT_CK(cudaMemcpy(m.shared, sh.data(), m.nl * sizeof(int), cudaMemcpyHostToDevice));
-        G6RT_CK(cudaMemcpy(m.errs, er.data(), m.nl * sizeof(unsigned*), cudaMemcpyHostToDevice));
+        G6RT_CK(g6h2d::copy(m.shared, sh.data(), m.nl * sizeof(int)));
+        G6RT_CK(g6h2d::copy(m.errs, er.data(), m.nl * sizeof(unsigned*)));
     }
 #if defined(G6_CP) && G6_CP
     if (m.cp.on)
@@ -459,7 +460,7 @@ inline void build(Model& m, int rank, const std::vector<int>& ids, const Find& f
     m.final_norm = (const __nv_bfloat16*)need(find, "G.final_norm");
     m.head_t = bind::head_tensors([&](const char* n) { return as_bind(find(n)); });
     if (!m.head_t.lm_head.p) die("pack has no G.lm_head.mx.gv (run tools/convert/addgv.py)");
-    if (!bind::vocab_slice(rank, m.vlo, m.vn)) die("rank must be 0..5");
+    if (!bind::vocab_slice(rank, m.vlo, m.vn)) die("rank must be 0.." + std::to_string(g6nr::NR - 1));
     m.hlog = dmalloc<float>((size_t)MX * m.vn);
 }
 

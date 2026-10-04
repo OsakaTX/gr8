@@ -402,7 +402,7 @@ __device__ __forceinline__ void tr3_fin_body(const K1Args& A, int plan)
     float acc[4] = {0.f, 0.f, 0.f, 0.f};
     {
         const int k = warp * 2;
-        uint2 zr[2][3], sr[2][3];
+        uint2 zr[2][g6nr::EB], sr[2][g6nr::EB];
         float w[2];
         bool on[2];
         int nb[2];
@@ -417,7 +417,7 @@ __device__ __forceinline__ void tr3_fin_body(const K1Args& A, int plan)
             nb[u] = on[u] ? static_cast<int>(tr[3]) : 0;
             const size_t row = static_cast<size_t>(tr[2]);
             #pragma unroll
-            for (int b = 0; b < 3; ++b)
+            for (int b = 0; b < g6nr::EB; ++b)
                 if (b < nb[u])
                 {
                     zr[u][b] = *reinterpret_cast<const uint2*>(A.z + ((static_cast<size_t>(sl) * A.B + b) * 8 + m) * HID + n0);
@@ -427,7 +427,7 @@ __device__ __forceinline__ void tr3_fin_body(const K1Args& A, int plan)
         #pragma unroll
         for (int u = 0; u < 2; ++u)
             #pragma unroll
-            for (int b = 0; b < 3; ++b)
+            for (int b = 0; b < g6nr::EB; ++b)
                 if (b < nb[u])
                 {
                     const float2 z01 = __half22float2(as_h2(zr[u][b].x)), z23 = __half22float2(as_h2(zr[u][b].y));

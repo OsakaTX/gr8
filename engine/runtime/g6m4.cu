@@ -1,6 +1,6 @@
 // M4 runtime: ONE rank of the mini model (a list of real layers + the real head) on the real fabric, one
 // process per Spark. Same rank step (rank.cuh) and same test sequence as m4sim; every rank prints the "step ..."
-// lines, and all six must equal m4sim's on the same packs.
+// lines, and all six (NR) must equal m4sim's on the same packs.
 //
 // Per step: host writes the StepIn block (pinned), hands the proxy the payload sizes of the step's 2*NL+1
 // collectives, launches the whole step on one stream (plain launches, or with --graph one replayed graph), waits for
@@ -102,15 +102,15 @@ int main(int argc, char** argv)
         else if (a == "--s2-epoch") s2epoch = strtoull(next().c_str(), nullptr, 10);
         else die("unknown argument " + a);
     }
-    if (cfg.rank < 0 || cfg.ips.size() != 6 || manifest.empty() || packfile.empty())
-        die("usage: g6m4 --rank R --ips six,addresses [--ips2 ..] --manifest M --pack P|- [--qo-manifest QM --qo-pack QP] [--layers ..] [--gen N] [--temp T]");
+    if (cfg.rank < 0 || cfg.ips.size() != (size_t)g6nr::NR || manifest.empty() || packfile.empty())
+        die("usage: g6m4 --rank R --ips NR,addresses (this build: NR = " + std::to_string(g6nr::NR) + ") [--ips2 ..] --manifest M --pack P|- [--qo-manifest QM --qo-pack QP] [--layers ..] [--gen N] [--temp T]");
     { const char* e = getenv("G6_DEC_SHARED_SCRATCH"); if (e && atoi(e) == 1 && !pfv2) die("G6_DEC_SHARED_SCRATCH=1 needs --pfv2"); }
     const std::vector<int> layers = parse_ints(layers_s);
     if (prompts.empty()) prompts.push_back("154822,154824,154826,25062");
     plan.inv_temp = temp > 0.f ? 1.f / temp : 0.f;
     if (plan.chunk < 1 || plan.chunk > MX) die("--chunk must be 1..8");
     if (mtp < 0 || mtp > MX - 1) die("--mtp must be 1..7 drafts");
-    if (nc < 0 || nc * 6 > glue::TP_SORT) die("--top-p-cands must be 0..341");
+    if (nc < 0 || nc * g6nr::NR > glue::TP_SORT) die("--top-p-cands must be 0.." + std::to_string(glue::TP_SORT / g6nr::NR));
     const bool s2mode = !s2dir.empty();
 #ifndef DEC_S2
     if (s2mode) die("--s2 needs a DEC_S2 build");

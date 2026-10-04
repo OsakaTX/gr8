@@ -1,4 +1,6 @@
 #include "bind.h"
+#include "../g6nr.h"
+#include "../h2d.h"
 #include <cuda_runtime.h>
 #include <climits>
 #include <initializer_list>
@@ -57,19 +59,20 @@ static int create(G6AttnBinding* out, const G6AttnPack* p, int rank, int layer, 
 extern "C" int g6_attn_bind_create_ext(G6AttnBinding* out, const G6AttnPack* p,
     int rank, int layer, int capacity, int max_rows, int query_tile, void* s, void* ext_scratch, size_t ext_bytes) {
 #endif
-    if (!out || out->storage || !p || rank < 0 || rank >= 6 || layer < 0 || layer > 78 ||
+    if (!out || out->storage || !p || rank < 0 || rank >= g6nr::NR || layer < 0 || layer > 78 ||
         capacity <= 0 || max_rows <= 0 || max_rows > capacity || query_tile <= 0 ||
         query_tile > 64 || capacity > INT_MAX / query_tile) return invalid;
-    const int group = (rank - layer % 6 + 6) % 6;
-    const int edges[] = {0, 11, 22, 33, 44, 54, 64};
-    const int h = edges[group + 1] - edges[group];
+    // head group of this rank at this layer (SPEC §9): (rank - layer) % NR, the larger groups first (TP6 edges
+    // 0,11,22,33,44,54,64; TP4 16 heads each)
+    const int group = (rank - layer % g6nr::NR + g6nr::NR) % g6nr::NR;
+    const int h = g6nr::width(g6nr::HEADS, group);
     const bool full = layer == 78 || layer <= 2 || (layer - 2) % 4 == 0;
     if (!shape(p->uk, {h,192,512}) || !shape(p->uv, {h,256,512}) ||
         !shape(p->kv_norm, {512}) ||
         (full && (!shape(p->index_norm, {128}) || !shape(p->index_bias, {128})))) return invalid;
 
     G6AttnBinding b{};
-    b.rank = rank; b.layer = layer; b.head_begin = edges[group];
+    b.rank = rank; b.layer = layer; b.head_begin = g6nr::start(g6nr::HEADS, group);
     b.capacity = capacity; b.max_rows = max_rows; b.full_index = full;
     G6Attn& a = b.args;
     a.rows = max_rows; a.context = capacity; a.heads = h; a.page_size = 64;
@@ -133,8 +136,7 @@ extern "C" int g6_attn_bind_create_ext(G6AttnBinding* out, const G6AttnPack* p,
             (const uint16_t*)p->uk.data, (uint16_t*)const_cast<void*>(a.uk), h * 512 * 192);
 #if defined(G6_CP) && G6_CP
         if (cp_nr) {   // after the storage memset on the same stream; synchronize: cp_table is a host temporary
-            e = cudaMemcpyAsync((void*)a.block_table, cp_table.data(), cp_table.size() * sizeof(int), cudaMemcpyHostToDevice, stream);
-            if (e == cudaSuccess) e = cudaStreamSynchronize(stream);
+            e = g6h2d::copy((void*)a.block_table, cp_table.data(), cp_table.size() * sizeof(int), stream);
         }
         else
 #endif

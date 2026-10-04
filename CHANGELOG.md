@@ -1,5 +1,18 @@
 # Changelog
 
+## 2026-10-04: TP4 (four Sparks) end to end, and pinned host-to-device copies
+
+- **TP4.** The engine builds and runs at `G6_NR=4` (`G6_NR=4 scripts/build.sh`). Every per-rank width that was a TP6
+  literal (attention head groups, vocab slice, routed-expert blocks and scratch, dense channels, buffer sizes, rank
+  count checks) now comes from `engine/g6nr.h`; at NR=6 the values are the old ones and the TP6 GPU code is unchanged.
+  The converter takes four GPTQ dirs (`tp4/r0..r3`) and writes four rank packs (`plan.set_nr`, `nr: 4` in the
+  manifests); `qopack.py` takes four rank packs; `build_packs.sh` picks TP4 from the GPTQ dir. New `launch_tp4.sh` and
+  `config/cluster.env.tp4.example`; `build.sh BUNDLE_LIBS=1` and `stage.sh SHARED=1` for nodes without the CUDA
+  toolkit and packs on a shared mount. TP4 runs `G6_PF_OWN=1`: the 13 GB QO pack does not fit next to a 90 GB TP4
+  rank pack. First numbers and the open QO question are on #2.
+- **Pinned host-to-device copies** (`engine/h2d.h`, `g6h2d::copy`). Every copy from pageable host memory to the GPU
+  goes through a per-thread pinned buffer, so a 64 KiB-page kernel cannot hang on it (#6). Host code only.
+
 ## 2026-10-04: gate harness (`bench/gate/`)
 
 - New: `bench/gate/gate.py` measures a build (KL drift, needle, long prompt, pbench, workloads, drafter counters), appends one JSON line per run, builds a baseline per topology and checks a build against it. See `bench/gate/README.md`. No engine change.

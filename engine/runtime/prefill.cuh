@@ -97,7 +97,7 @@ __host__ __device__ inline int pf_rows(int M, int p, int nr) { return pf_r0(M, p
 __host__ __device__ inline size_t pf_ss(const g6::FabricDev& f) { return (f.stride / f.nr) & ~size_t(255); }
 inline size_t pf_ss_min(int Mmax, int nr) { return ((size_t)(Mmax + nr - 1) / nr * HID * 2 + 8 + 255) & ~size_t(255); }
 // FabricConfig::slot_bytes of a prefill region
-inline size_t pf_slot_bytes(int Mmax, bool rs, int nr = 6)
+inline size_t pf_slot_bytes(int Mmax, bool rs, int nr = g6nr::NR)
 {
     const size_t ar = (size_t)Mmax * HID * 2;
     return rs ? std::max(ar, nr * pf_ss_min(Mmax, nr)) : ar;
@@ -440,7 +440,7 @@ struct Prefill
     std::string pd_dir;
     std::vector<char> pd_lay;                            // per layer position: 1 = dump, 2 = index scores only (the
     int pd_every = 32;                                   //   full-index source of a dumped reuse layer)
-    float *pd_probs = nullptr, *pd_isc = nullptr;        // [attn_rows][11][2048], [attn_rows][capacity]
+    float *pd_probs = nullptr, *pd_isc = nullptr;        // [attn_rows][HMAX][2048], [attn_rows][capacity]
     std::string rc_file;                                 // G6_PF_RCDUMP=<dir> (read at build, every rank; measurement
                                                          //   only): <dir>/routes.r<rank>.jsonl, see pf_rcdump
 };
@@ -491,7 +491,7 @@ inline void build_prefill(Prefill& P, Model& m, const Find& find, int Mmax, cons
     P.q_a = dmalloc<__half>(n * QA);
     P.q_a_n = dmalloc<__half>(n * QA);
     P.kv_a = dmalloc<__half>(n * KVA);
-    P.q_b = dmalloc<__half>(n * 11 * 256);
+    P.q_b = dmalloc<__half>(n * g6nr::QBW);
     P.idx_q = dmalloc<__half>(n * IDXQ);
     P.idx_k = dmalloc<__half>(n * IDXK);
     P.idx_w = dmalloc<__half>(n * IDXW);
@@ -519,7 +519,7 @@ inline void build_prefill(Prefill& P, Model& m, const Find& find, int Mmax, cons
     }
     const bool chunked = P.attn_rows > 0 && P.attn_rows < Mmax;
     if (!chunked) P.attn_rows = Mmax;
-    else P.attn_out = dmalloc<__half>(n * 11 * 256);
+    else P.attn_out = dmalloc<__half>(n * g6nr::QBW);
     if (chunked || P.ownix || P.qo) P.idx_all = dmalloc<int>(n * 2048);
     if (P.qo)
     {
@@ -562,7 +562,7 @@ inline void build_prefill(Prefill& P, Model& m, const Find& find, int Mmax, cons
             k = ls.find(',', k); if (k == std::string::npos) break; ++k;
         }
         P.pd_dir = d;
-        P.pd_probs = dmalloc<float>((size_t)P.attn_rows * 11 * 2048);
+        P.pd_probs = dmalloc<float>((size_t)P.attn_rows * g6nr::HMAX * 2048);
         P.pd_isc = dmalloc<float>((size_t)P.attn_rows * m.layers[0].ab.capacity);
         if (m.rank == 0) fprintf(stderr, "# G6_PF_PDUMP %s: every %d rows, layers %s (+ index-score sources)\n", d, P.pd_every, ls.c_str());
     }
@@ -843,13 +843,13 @@ inline void pf_inputs(Prefill& P, int M, const int* tok, const int* pos)
         const std::vector<int> o = pf_perm_order(M, P.f.nr);
         std::vector<int> t(M), p(M);
         for (int j = 0; j < M; ++j) { t[j] = tok[o[j]]; p[j] = pos[o[j]]; }
-        G6RT_CK(cudaMemcpy(P.tok, t.data(), M * sizeof(int), cudaMemcpyHostToDevice));
-        G6RT_CK(cudaMemcpy(P.pos, p.data(), M * sizeof(int), cudaMemcpyHostToDevice));
-        G6RT_CK(cudaMemcpy(P.ord, o.data(), M * sizeof(int), cudaMemcpyHostToDevice));
+        G6RT_CK(g6h2d::copy(P.tok, t.data(), M * sizeof(int)));
+        G6RT_CK(g6h2d::copy(P.pos, p.data(), M * sizeof(int)));
+        G6RT_CK(g6h2d::copy(P.ord, o.data(), M * sizeof(int)));
         return;
     }
-    G6RT_CK(cudaMemcpy(P.tok, tok, M * sizeof(int), cudaMemcpyHostToDevice));
-    G6RT_CK(cudaMemcpy(P.pos, pos, M * sizeof(int), cudaMemcpyHostToDevice));
+    G6RT_CK(g6h2d::copy(P.tok, tok, M * sizeof(int)));     // pageable sources: pinned staging (h2d.h)
+    G6RT_CK(g6h2d::copy(P.pos, pos, M * sizeof(int)));
 }
 inline void pf_embed(Model& m, Prefill& P, int M, cudaStream_t st)
 {
@@ -1665,8 +1665,7 @@ inline void cp_pf_alloc(Model& m, cudaStream_t st, char* region = nullptr)
     m.cp.pf_ident = dmalloc<int>(a.table_size);
     std::vector<int> id(a.table_size);
     for (int k = 0; k < a.table_size; ++k) id[k] = k;
-    G6RT_CK(cudaMemcpyAsync(m.cp.pf_ident, id.data(), id.size() * sizeof(int), cudaMemcpyHostToDevice, st));
-    G6RT_CK(cudaStreamSynchronize(st));
+    G6RT_CK(g6h2d::copy(m.cp.pf_ident, id.data(), id.size() * sizeof(int), st));
     fprintf(stderr, "# rank %d: G6_CP prefill staging 2 x %.3f GB (%s)\n", m.rank, pool / 1e9, region ? "pinned, registered" : "device");
 }
 inline void cp_pf_enter(Model& m)

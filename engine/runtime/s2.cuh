@@ -100,7 +100,7 @@ inline void s2_write_table(Model& m, int q)
     S2Model& s = *m.s2;
     std::vector<int> t(s.run_pages);
     for (int i = 0; i < s.run_pages; ++i) t[i] = i < s.pages[q] ? s.base[q] + i : -1;   // -1 past the run: attention error bit 2
-    for (int l = 0; l < m.nl; ++l) G6RT_CK(cudaMemcpy(const_cast<int*>(s.sab[l][q]->args.block_table), t.data(), t.size() * 4, cudaMemcpyHostToDevice));
+    for (int l = 0; l < m.nl; ++l) G6RT_CK(g6h2d::copy(const_cast<int*>(s.sab[l][q]->args.block_table), t.data(), t.size() * 4));
 }
 inline void s2_init(Model& m, int nslots, cudaStream_t st)
 {
@@ -191,7 +191,7 @@ inline void s2_init(Model& m, int nslots, cudaStream_t st)
     }
     m.s2 = s;
     for (int q = 0; q < nslots; ++q) s2_write_table(m, q);
-    G6RT_CK(cudaMemcpy(s->errs, er.data(), er.size() * sizeof(unsigned*), cudaMemcpyHostToDevice));
+    G6RT_CK(g6h2d::copy(s->errs, er.data(), er.size() * sizeof(unsigned*)));
     G6RT_CK(cudaStreamSynchronize(st));
     if (m.rank == 0)
         fprintf(stderr, "# s2: %d session slots, runs of at most %d pages in a pool of %d pages (%s), %d layers: %.3f GB pool storage, %.3f GB new slot views (%d rows)\n",
@@ -272,13 +272,13 @@ inline void s2_solo_run(Model& m, int base_page, int pages)
         {
             std::vector<int> t = s.tab0[l];
             if (base_page) for (size_t i = 0; i < t.size(); ++i) t[i] = (int)i < pages ? base_page + (int)i : -1;
-            G6RT_CK(cudaMemcpy(const_cast<int*>(s.pool[l]->args.block_table), t.data(), t.size() * 4, cudaMemcpyHostToDevice));
+            G6RT_CK(g6h2d::copy(const_cast<int*>(s.pool[l]->args.block_table), t.data(), t.size() * 4));
         }
         return;
     }
     std::vector<int> t(s.pool_pages);
     for (int i = 0; i < s.pool_pages; ++i) t[i] = i < pages ? base_page + i : -1;
-    for (G6AttnBinding* p : s.pool) G6RT_CK(cudaMemcpy(const_cast<int*>(p->args.block_table), t.data(), t.size() * 4, cudaMemcpyHostToDevice));
+    for (G6AttnBinding* p : s.pool) G6RT_CK(g6h2d::copy(const_cast<int*>(p->args.block_table), t.data(), t.size() * 4));
 }
 // compatibility: the last s2_solo_run's pages (default run_pages, the full reservation)
 inline void s2_solo_base(Model& m, int base_page) { s2_solo_run(m, base_page, m.s2->solo_pages); }

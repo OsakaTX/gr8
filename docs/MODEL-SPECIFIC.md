@@ -15,12 +15,12 @@ the full-index layers; vocab 154,880.
 |---|---|---|
 | weight format | `engine/kernels/tr3.cuh`, `tr3_gemm.cuh`, `tr3_wide.cuh` | routed experts are EXL3 "TR3" trellis codes (3.25 bpw, Hadamard-128 rotations, K3/K4 per-expert bit widths), decoded inside the expert kernels |
 | | `engine/kernels/densev.cuh`, `gemm_x.cuh`, `rowtile.cuh` | dense weights: MXFP8 for prefill + lm_head, GPTQ int4 g32 for decode |
-| converter | `tools/convert/plan.py` | `H = 6144`, 78 + 1 layers, 256 experts, the TP6 rank map: head groups `(11,11,11,11,10,10)`, expert 128-column blocks `(3,3,3,3,2,2)`, vocab tiles, rotated per layer |
+| converter | `tools/convert/plan.py` | `H = 6144`, 78 + 1 layers, 256 experts, the rank map: TP6 head groups `(11,11,11,11,10,10)`, expert 128-column blocks `(3,3,3,3,2,2)`, vocab tiles, rotated per layer (TP4: 16 heads, 4 blocks, dense 3072 channels, vocab tiles `(303,303,302,302)`) |
 | | `tools/convert/convert.py` | checkpoint tensor names (`model.layers.N.self_attn.q_a_proj.weight`, ...), MLA reshapes (`q_b` -> 64 x 256 x 2048, `kv_b` -> 64 x 448 x 512), dense layers 0-2, the MTP layer's extra tensors (`eh`) |
-| | `tools/convert/qopack.py` | `QO_EDGES` head-group edges for the full-head QO pack |
+| | `tools/convert/qopack.py` | `qo_edges` head-group edges for the full-head QO pack (64 heads) |
 | | `engine/ref/g6ref.py` | record layouts the kernels read (rt_record, GEMV records) |
 | kernels | `engine/kernels/common.cuh` | `HID = 6144` |
-| | `engine/kernels/k1args.cuh` | `SMAX = 72` distinct experts per step, `ACTW = 384` routed columns per rank, `SACTW = 2048` shared/dense columns |
+| | `engine/kernels/k1args.cuh` | `SMAX = 72` distinct experts per step, `ACTW` routed columns per rank (`g6nr::EB * 128`), `SACTW` shared/dense columns (`g6nr::DENSE_CH`) |
 | | `engine/kernels/glue.cuh`, `k1.cuh` | router (sigmoid top-8 of 256 + shared), RMSNorm, embed, head local argmax/LSE + sampling |
 | attention | `engine/attn/` | MLA latent attention (kv_a 576 = 512 + 64 rope, UK/UV absorb), the DSA-style sparse indexer and its exact top-2048 selector (`select.cuh`), value head dim 256 in decode (`decode-small.cuh`) |
 | | `engine/runtime/rank.cuh` | `QA = 2048`, `KVA = 576`, `IDXQ = 4096`, `IDXK = 128`, `IDXW = 32`; the layer sequence (dense / MoE / MTP) |
@@ -29,12 +29,17 @@ the full-index layers; vocab 154,880.
 | | `frontend/g6front/glm_parser.py` | GLM's `<think>` reasoning and `<tool_call>NAME<arg_key>..</arg_key><arg_value>..</arg_value></tool_call>` format |
 | | `frontend/g6front/template.py`, `tokenizer.py` | read `chat_template.jinja` / `tokenizer.json` from `--model-dir`, so these follow the model directory |
 
-## Topology-specific (TP6)
+## Topology-specific (TP6, TP4)
 
-- `engine/g6nr.h`: the rank count `G6_NR`. Default 6; the engine also compiles for divisors of 64 (`-DG6_NR=4` is our
-  TP4 build, which is not part of this snapshot). Any other count needs the matching rank map.
-- `tools/convert/plan.py`: `NR = 6` and the widths above. The converter only writes TP6 packs.
-- `tools/convert/convert.py --d8`: six GPTQ dirs, one per rank, because the GPTQ codes are solved per rank slice.
+- `engine/g6nr.h`: the rank count `G6_NR`. Default 6; `-DG6_NR=4` builds TP4 (`G6_NR=4 scripts/build.sh`). Every
+  per-rank width the engine uses (heads, expert blocks, dense channels, vocab slice, scratch sizes) comes from it;
+  the NR=6 values equal the old TP6 literals, so the TP6 build is SASS-identical. The engine also compiles for other
+  divisors of 64, but only 6 and 4 have been run.
+- `tools/convert/plan.py`: `set_nr(n)` picks the widths; they split n units the way `g6nr.h` does (larger chunks first).
+- `tools/convert/convert.py --d8`: one GPTQ dir per rank (six for TP6, four for TP4), because the GPTQ codes are solved
+  per rank slice. The count of dirs sets the rank count of the packs. TP4 needs the TP4 codes.
+- `scripts/launch_tp6.sh` / `scripts/launch_tp4.sh`: the rank count and the KV pool. `stage.sh` and `stop.sh` work
+  for any number of `HOSTS`.
 
 ## Not model-specific: reusable as is
 

@@ -39,7 +39,7 @@
 
 using namespace g6rt;
 
-constexpr int NR = 6;
+constexpr int NR = g6nr::NR;           // simulated ranks: six, or four in a -DG6_NR=4 build
 
 // the NIC: every rank's send slot of collective c -> the shared recv slot [c][rank], then the tail. grid NR, block 128.
 struct Loop
@@ -177,7 +177,7 @@ int main(int argc, char** argv)
     plan.inv_temp = temp > 0.f ? 1.f / temp : 0.f;
     if (plan.chunk < 1 || plan.chunk > MX) die("--chunk must be 1..8");
     if (mtp < 0 || mtp > MX - 1) die("--mtp must be 1..7 drafts");
-    if (nc < 0 || nc * 6 > glue::TP_SORT) die("--top-p-cands must be 0..341");
+    if (nc < 0 || nc * NR > glue::TP_SORT) die("--top-p-cands must be 0.." + std::to_string(glue::TP_SORT / NR));
 #ifdef DEC_S2
     if (s2mode && (!mtp || MP || !serve.empty() || prompts.size() > (size_t)S2N)) die("--s2 needs --mtp, no --prefill / --serve, at most 8 --prompt");
 #else
@@ -439,7 +439,7 @@ int main(int argc, char** argv)
 #ifdef DEC_S2
         if (pf_base) x.base_page = pf_base;
 #endif
-        G6RT_CK(cudaMemcpy(dst, &x, sizeof x, cudaMemcpyHostToDevice));
+        G6RT_CK(g6h2d::copy(dst, &x, sizeof x));
     };
     loop_d.recv = recv_d; loop_d.stepp = stepp_d; loop_d.ncoll = NCD; loop_d.stride = stride;
     loop.recv = recv; loop.stepp = stepp; loop.ncoll = NC; loop.stride = stride;
@@ -906,8 +906,8 @@ int main(int argc, char** argv)
                     }
                     prepped.insert(key);
                 }
-                G6RT_CK(cudaMemcpy(draft ? in_d : in, &si, sizeof si, cudaMemcpyHostToDevice));
-                G6RT_CK(cudaMemcpy(draft ? in_s2d : in_s2, &h, sizeof h, cudaMemcpyHostToDevice));
+                G6RT_CK(g6h2d::copy(draft ? in_d : in, &si, sizeof si));
+                G6RT_CK(g6h2d::copy(draft ? in_s2d : in_s2, &h, sizeof h));
                 const auto t0 = std::chrono::steady_clock::now();
                 if (graph)
                 {
@@ -1157,7 +1157,7 @@ int main(int argc, char** argv)
                             uint32_t* at = reinterpret_cast<uint32_t*>(L[pr].resid) + static_cast<size_t>(row) * HID;
                             G6RT_CK(cudaMemcpy(&w, at, 4, cudaMemcpyDeviceToHost));
                             ++w;
-                            G6RT_CK(cudaMemcpy(at, &w, 4, cudaMemcpyHostToDevice));
+                            G6RT_CK(g6h2d::copy(at, &w, 4));
                             fprintf(stderr, "# poke: rank %d row %d +1 ulp\n", pr, a0 + row);
                         }
                     }

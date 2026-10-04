@@ -24,7 +24,7 @@ struct DevStore
         if (it != by_sha.end()) { shared_bytes += e.nbytes; return it->second; }
         void* d;
         G6RT_CK(cudaMalloc(&d, e.nbytes));
-        G6RT_CK(cudaMemcpy(d, pack.base() + e.offset, e.nbytes, cudaMemcpyHostToDevice));
+        G6RT_CK(g6h2d::copy(d, pack.base() + e.offset, e.nbytes));   // pageable source: pinned staging (h2d.h)
         by_sha[key] = d;
         bytes += e.nbytes;
         return d;

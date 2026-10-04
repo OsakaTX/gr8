@@ -45,7 +45,8 @@ __host__ __device__ __forceinline__ void tr3w_pack(u64 (&v)[3], int p, u32 chunk
 }
 
 // In-place pack order -> wide order for every K3 expert of the rank's tr3.fc1. tab = tr3.table [E][6] (fc1 byte
-// offset, -, -, n blocks, bits, -). grid = E * nb * 2 * (KSH / 8), nb = max blocks per expert (3), block = 256.
+// offset, -, -, n blocks, bits, -). grid = E * nb * 2 * (KSH / 8), nb = max blocks per expert (g6nr::EB: 3 at TP6,
+// 4 at TP4), block = 256.
 // Run it exactly once per tensor: a second run would scramble the bits.
 __global__ void __launch_bounds__(256) k_tr3_widen(uint8_t* fc1, const long long* tab, int nb)
 {

@@ -104,7 +104,7 @@ inline void widen_fc1(LayerTensors& T, cudaStream_t st)
 {
     const Tensor &tab = T.t[T_TR3_TAB], &fc1 = T.t[T_TR3_FC1];
     if (!tab.p || !fc1.p || T.fc1_wide) return;
-    launch_tr3_widen(const_cast<void*>(fc1.p), static_cast<const long long*>(tab.p), static_cast<int>(tab.shape[0]), 3, st);
+    launch_tr3_widen(const_cast<void*>(fc1.p), static_cast<const long long*>(tab.p), static_cast<int>(tab.shape[0]), g6nr::EB, st);
     T.fc1_wide = 1;
 }
 // The same for tr3.fc2 (k_tr3_widen2: the 8 k-tiles of an n-tile in three 64-bit loads). Same rules, same results bit for bit.
@@ -112,7 +112,7 @@ inline void widen_fc2(LayerTensors& T, cudaStream_t st)
 {
     const Tensor &tab = T.t[T_TR3_TAB], &fc2 = T.t[T_TR3_FC2];
     if (!tab.p || !fc2.p || T.fc2_wide) return;
-    launch_tr3_widen2(const_cast<void*>(fc2.p), static_cast<const long long*>(tab.p), static_cast<int>(tab.shape[0]), 3, st);
+    launch_tr3_widen2(const_cast<void*>(fc2.p), static_cast<const long long*>(tab.p), static_cast<int>(tab.shape[0]), g6nr::EB, st);
     T.fc2_wide = 1;
 }
 
@@ -179,8 +179,8 @@ inline size_t scratch_layout(Scratch* s, char* base)
     t.xf_attn = reinterpret_cast<u32*>(take(xf));
     t.xf_x2 = reinterpret_cast<u32*>(take(xf));
     t.xb_x2 = reinterpret_cast<u32*>(take(xf));
-    t.gpart = reinterpret_cast<float*>(take(static_cast<size_t>(SMAX) * 3 * 2 * GPMAX * 8 * 128 * sizeof(float)));
-    t.z = reinterpret_cast<__half*>(take(static_cast<size_t>(SMAX) * 3 * 8 * HID * 2));
+    t.gpart = reinterpret_cast<float*>(take(static_cast<size_t>(SMAX) * g6nr::EB * 2 * GPMAX * 8 * 128 * sizeof(float)));
+    t.z = reinterpret_cast<__half*>(take(static_cast<size_t>(SMAX) * g6nr::EB * 8 * HID * 2));
     t.act = reinterpret_cast<__half*>(take((static_cast<size_t>(SMAX) * 8 * ACTW + static_cast<size_t>(8) * SACTW) * 2));
     t.ypart = reinterpret_cast<__half*>(take(static_cast<size_t>(SMAX + 1) * 8 * HID * 2));
     t.part[0] = reinterpret_cast<uint16_t*>(take(static_cast<size_t>(8) * HID * 2));
@@ -190,7 +190,7 @@ inline size_t scratch_layout(Scratch* s, char* base)
     if (s) *s = t;
     return o;
 }
-// One block per rank (58.3 MB). Simulated ranks that run one after another on one stream may share a block.
+// One block per rank (58.3 MB at TP6). Simulated ranks that run one after another on one stream may share a block.
 // Zero it once after allocation (the control cells must start at 0).
 inline size_t scratch_bytes() { return scratch_layout(nullptr, nullptr); }
 inline Scratch scratch_at(void* block)
@@ -412,7 +412,7 @@ inline const char* make_k1(const LayerTensors& T, int M, const Scratch& sc, cons
     memset(&a, 0, sizeof a);
     a.x = x2; a.xfrag = xf_x2;
     a.ctl = sc.ctl; a.n_plans = 1; a.M = M;
-    a.B = 3; a.KS1 = s.KS1; a.WG = s.WG; a.NS2 = s.NS2;
+    a.B = g6nr::EB; a.KS1 = s.KS1; a.WG = s.WG; a.NS2 = s.NS2;
     a.s_fc1 = static_cast<const uint8_t*>(f1.p); a.s_fc2 = static_cast<const uint8_t*>(f2.p);
     a.s_up = mx ? static_cast<const uint8_t*>(fu.p) : nullptr; a.s_mx = mx;
     a.s_nch = s_nch; a.s_ks = s.s_ks; a.s_cw = w1 / s.s_ks; a.s_ns2 = s.s_ns2;
@@ -607,22 +607,20 @@ template <class F> inline HeadTensors head_tensors(F find)
     return T;
 }
 
-// Vocab slice of rank r (SPEC §9): 154880 rows = 1210 tiles of 128, ranks own [202,202,202,202,201,201] tiles in
-// rank order, not rotated. Returns false if r is not 0..5.
+// Vocab slice of rank r (SPEC §9): 154880 rows = 1210 tiles of 128 in rank order, not rotated, the larger slices first
+// (g6nr.h): TP6 [202,202,202,202,201,201] tiles, TP4 [303,303,302,302]. Returns false if r is not 0..NR-1.
 inline bool vocab_slice(int rank, int& vlo, int& vn)
 {
-    static const int tiles[6] = {202, 202, 202, 202, 201, 201};
-    if (rank < 0 || rank > 5) return false;
-    vlo = 0;
-    for (int r = 0; r < rank; ++r) vlo += tiles[r] * 128;
-    vn = tiles[rank] * 128;
+    if (rank < 0 || rank >= g6nr::NR) return false;
+    vlo = g6nr::start(g6nr::VTILES, rank) * 128;
+    vn = g6nr::width(g6nr::VTILES, rank) * 128;
     return true;
 }
 
 struct HeadIo                         // device memory
 {
     const __half* h = nullptr;        // in  [8][6144]  lm_head input (final_norm output; MTP: shared_head_norm output)
-    float* logits = nullptr;          // out [8][vn] fp32, vn = this rank's slice width (at most 25856)
+    float* logits = nullptr;          // out [8][vn] fp32, vn = this rank's slice width (at most 25856 at TP6, 38784 at TP4)
     const __half* eh_in = nullptr;    // in  [8][12288] eh_proj input row (the two normed halves, concatenated by the caller)
     __half* eh = nullptr;             // out [8][6144]
 };
@@ -640,7 +638,7 @@ inline const char* make_head(const HeadTensors& T, int rank, int M, const Scratc
 {
     H = Head();
     if (M < 1 || M > 8) return "M must be 1..8";
-    if (!vocab_slice(rank, H.vlo, H.vn)) return "rank must be 0..5";
+    if (!vocab_slice(rank, H.vlo, H.vn)) return "rank must be 0..NR-1";
     H.M = M;
     const char* e = nullptr;
     // best split on the GB10 (engine/results/item2-gv.jsonl): lm_head_rank tpc 1 ks 32, mtp_eh tpc 2 ks 16

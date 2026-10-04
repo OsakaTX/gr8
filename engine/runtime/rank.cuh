@@ -28,6 +28,7 @@
 #include <functional>
 #include <string>
 #include <vector>
+#include "draft_shape.h"
 #include "../kernels/glue.cuh"
 #include "../kernels/bind.cuh"
 #include "../attn/bind.h"
@@ -81,6 +82,9 @@ struct StepIn
     int tok[MX], pos[MX];
     glue::SampleRow srow[MX];
     int tgt[MX];                      // teacher forcing: the id each row should predict (< 0 = none)
+#ifdef DEC_S2
+    int base_page, pad_s2;            // S2 (TP4 option (a), provisional): first pool page of the session (0 = today)
+#endif
 };
 struct StepOut
 {
@@ -112,7 +116,11 @@ __global__ void __launch_bounds__(128) k_step_in(StepCtl c)
     for (int l = t; l < c.nl; l += 128)
     {
         c.cells[l].context = sh.context;
+#ifdef DEC_S2
+        c.cells[l].page_count = sh.base_page + pages;   // the physical page bound of a run at base_page (table B + i)
+#else
         c.cells[l].page_count = pages;
+#endif
         c.cells[l].table_size = pages;
         c.cells[l].reuse_rows = c.shared[l] ? sh.M : 0;
     }
@@ -186,9 +194,22 @@ inline size_t cp_blk(int M, int H) { return ((size_t)M * H * 514 + 3) & ~(size_t
 inline int cp_heads(int d, int l) { return g6nr::width(g6nr::HEADS, (d - l % g6nr::NR + g6nr::NR) % g6nr::NR); }
 #endif
 
+#ifdef DEC_S2
+struct S2Model;                       // s2.cuh: S2 batched decode state (sessions' rows in one step)
+#endif
 struct Model
 {
     int rank = -1, nl = 0;
+#ifdef DEC_S2
+    S2Model* s2 = nullptr;            // s2_init; s2on: steps go through the S2 hooks (layer_for, attention, step in / out)
+    bool s2on = false;
+    int s2_pool_slots = 1;            // set before build: > 1 = the layers' own attention bindings hold the S2 pool
+    int s2_run_pages = 0;             // build: the MOST pages one session's run can hold (the capacity argument; each view's table)
+    int s2_pool_pages = 0;            // set before build: pages of the pool (0 = s2_pool_slots x s2_run_pages); >= s2_run_pages
+    int s2_pf_base = 0;               // S2 below R: first page of the run being prefilled (CP staging index offset, prefill.cuh)
+    int s2_below = 0;                 // set before s2_init: S2 below R (CP builds): every session's run <= s2_below rows on the
+                                      // replicated (non-CP) path; the pool is the layer's own binding as built (s2.cuh)
+#endif
     bool graph = false;               // attention through the replay entry (set before prepare)
     bool wide = false;                // set before build: tr3.fc1 K3 records into the wide order, in place (bind::widen_fc1)
     // graph form: captured attention capacities, ascending, the last = the binding's capacity. G6_DEC_BK=B (read at
@@ -331,12 +352,25 @@ inline void build(Model& m, int rank, const std::vector<int>& ids, const Find& f
     // layers one after another on one stream; each run re-initializes the scratch). The draft (ids {78}) keeps its own.
     // The drivers die without --pfv2 (the v1 prefill lanes would run two layers' attention at once).
     const int attn_rows = max_rows < MX ? MX : max_rows;
+#ifdef DEC_S2
+    // S2 pool (decision on the S=1 transition contract): the binding holds s2_pool_slots runs of the reservation;
+    // the context buckets stay those of one run, so the S=1 graphs keep today's buckets. Under CP the pool is the CP
+    // binding itself (S2 below R, s2.cuh), so no slot multiple there.
+    m.s2_run_pages = (capacity + 63) / 64;
+#if defined(G6_CP) && G6_CP
+    if (m.cp.on && (m.s2_pool_slots > 1 || m.s2_pool_pages)) die("DEC_S2 + G6_CP: s2_pool_slots > 1 is not the CP pool (S2 below R uses the CP binding)");
+#endif
+    if (m.s2_pool_pages && m.s2_pool_pages < m.s2_run_pages) die("s2: s2_pool_pages < one session's run");
+    const int cap_ab = m.s2_pool_pages ? m.s2_pool_pages * 64 : m.s2_pool_slots > 1 ? m.s2_pool_slots * m.s2_run_pages * 64 : capacity;
+#else
+    const int cap_ab = capacity;
+#endif
     {
         const char* e = getenv("G6_DEC_SHARED_SCRATCH");
         if (e && atoi(e) == 1 && !(m.nl == 1 && ids[0] == 78))
         {
-            m.dscratch_bytes = std::max(g6_attn_bind_scratch_need(10, capacity, attn_rows, 16),
-                                        g6_attn_bind_scratch_need(11, capacity, attn_rows, 16));
+            m.dscratch_bytes = std::max(g6_attn_bind_scratch_need(10, cap_ab, attn_rows, 16),
+                                        g6_attn_bind_scratch_need(11, cap_ab, attn_rows, 16));
             if (!m.dscratch_bytes) die("G6_DEC_SHARED_SCRATCH: bad attention shape");
             m.dscratch = dmalloc<char>(m.dscratch_bytes);     // zeroed
         }
@@ -382,7 +416,7 @@ inline void build(Model& m, int rank, const std::vector<int>& ids, const Find& f
         }
         else
 #endif
-        G6RT_CK(g6_attn_bind_create_ext(&y.ab, &y.ap, rank, y.l, capacity, attn_rows, 16, st, m.dscratch, m.dscratch_bytes));
+        G6RT_CK(g6_attn_bind_create_ext(&y.ab, &y.ap, rank, y.l, cap_ab, attn_rows, 16, st, m.dscratch, m.dscratch_bytes));
         y.attn_norm = (const __nv_bfloat16*)need(find, lname(y.l, "attn_norm"));
         y.mlp_norm = (const __nv_bfloat16*)need(find, lname(y.l, "mlp_norm"));
         y.q_a_norm = (const __nv_bfloat16*)need(find, lname(y.l, "q_a_norm"));
@@ -429,7 +463,15 @@ inline void build(Model& m, int rank, const std::vector<int>& ids, const Find& f
     m.hlog = dmalloc<float>((size_t)MX * m.vn);
 }
 
-inline const bind::Layer& layer_for(Model& m, int i, int M)
+#ifdef DEC_S2
+inline const bind::Layer& s2_layer(Model& m, int i, int M);
+inline const bind::Layer& layer_base(Model& m, int i, int M);
+inline const bind::Layer& layer_for(Model& m, int i, int M) { return m.s2on ? s2_layer(m, i, M) : layer_base(m, i, M); }
+#define G6RT_LAYER_BASE layer_base
+#else
+#define G6RT_LAYER_BASE layer_for
+#endif
+inline const bind::Layer& G6RT_LAYER_BASE(Model& m, int i, int M)
 {
     Layer& y = m.layers[i];
     if (!y.built[M])
@@ -482,6 +524,11 @@ inline void put_publish(Model& m, const uint16_t* staging, int c, int M, cudaStr
     k_put_publish<<<1, 128, 0, st>>>(reinterpret_cast<const uint4*>(staging), m.f, m.stepp, c, M * (HID * 2 / 16), m.tickets + c);
 }
 
+#ifdef DEC_S2
+inline void s2_attention(Model& m, int i, int M, cudaStream_t st);
+inline void s2_launch_cells(Model& m, cudaStream_t st);
+inline StepEnd s2_step_end(Model& m, StepEnd e);
+#endif
 inline G6AttnStep attn_step(Model& m, int i, int M, int context)
 {
     Layer& y = m.layers[i];
@@ -586,12 +633,26 @@ inline void launch_attn_cp(Model& m, int i, int M, int context, int phase, cudaS
                                                    nullptr, 0, C.vs[cpart(k)], m.stepp, C.tickets + cpart(k));
     }
     if (phase == 1) return;
+#ifdef CP_F1A
+    {
+        static_assert(g6nr::NR - 1 <= 7, "VParts holds 7 partials");
+        cpglue::VParts p{};   // F1a: the nr-1 waits + gets below in one launch (same slots, same bytes, same destinations)
+        for (int k = 1; k < nr; ++k)
+        {
+            p.v[k - 1] = C.vs[cpart(k)];
+            if (p.v[k - 1].nsrc != 1) die("G6_CP F1a: partial collective with " + std::to_string(p.v[k - 1].nsrc) + " sources");
+            p.dst[k - 1] = part_of(p.v[k - 1].src[0]);
+        }
+        cpglue::k_vwaitget<<<dim3(G, nr - 1), 256, 0, st>>>(p, m.stepp, pw, (size_t)M * H * 514 * 4, cpglue::ERR_CP);
+    }
+#else
     for (int k = 1; k < nr; ++k)
     {
         const g6::VSlotDev& v = C.vs[cpart(k)];
         cpglue::k_vwait<<<1, 32, 0, st>>>(v, m.stepp, pw, -1, cpglue::ERR_CP);
         cpglue::k_vget<<<G, 256, 0, st>>>(v, 0, m.stepp, part_of(v.src[0]), (size_t)M * H * 514 * 4);   // partials of MY heads
     }
+#endif
     G6RT_CK(g6_attn_cp_finish(a, cell, scr, sb, C.part_all, st));
     dmark(1, st);
     bind::launch(b.xf_attn, st);
@@ -609,6 +670,11 @@ inline void launch_attn_cp(Model& m, int i, int M, int context, int phase, cudaS
 inline void launch_attn_block(Model& m, int i, int M, int context, cudaStream_t st)
 {
 #if defined(G6_CP) && G6_CP
+#ifdef DEC_S2
+    // S2 below R: every session's run is <= G6_CP_R rows (s2_init run_pages), so an S2 step never takes the CP block;
+    // m.cur is not the S2 step's bucket (each slot has its own, S2Model::bk)
+    if (!m.s2on)
+#endif
     if (cp_active(m, context)) { launch_attn_cp(m, i, M, context, -1, st); return; }
 #endif
     Layer& y = m.layers[i];
@@ -628,6 +694,10 @@ inline void launch_attn_block(Model& m, int i, int M, int context, cudaStream_t 
     bind::launch(b.q_b, st);
     bind::launch(b.idx_q, st);
     dmark(0, st);
+#ifdef DEC_S2
+    if (m.s2on) s2_attention(m, i, M, st);
+    else
+#endif
     if (m.graph)
     {
         if (!y.rp_on[m.cur][M]) die("prepare(m, M) was not called before a graph step");
@@ -786,9 +856,15 @@ inline void launch_step_in(Model& m, cudaStream_t st)
 {
     k_step_in<<<1, 128, 0, st>>>(StepCtl{reinterpret_cast<const uint32_t*>(m.in), m.stepp, m.tok, m.pos, m.tgt, m.srow, m.cells,
                                          m.shared, m.nl});
+#ifdef DEC_S2
+    if (m.s2on) s2_launch_cells(m, st);
+#endif
 }
 inline void launch_step_out(Model& m, int M, cudaStream_t st)
 {
+#ifdef DEC_S2
+    if (m.s2on) { k_step_out<<<1, 128, 0, st>>>(s2_step_end(m, StepEnd{m.tok_out, m.lp, m.lpt, m.errs, m.nl, M, m.out})); return; }
+#endif
     k_step_out<<<1, 128, 0, st>>>(StepEnd{m.tok_out, m.lp, m.lpt, m.errs, m.nl, M, m.out});
 }
 
@@ -936,23 +1012,43 @@ inline void build_draft(Draft& D, const Model& main, const Find& find, int capac
     D.hprev = dmalloc<__half>(HID);
     D.main_x = main.x;
 }
+#ifdef DEC_S2
+inline const __half* s2_draft_hid(Draft& D, bool chain, cudaStream_t st);
+inline void s2_draft_keep(Draft& D, cudaStream_t st);
+inline int s2_sessions(const Model& m);
+#endif
 // the draft step's "embedding": StepIn cells -> eh input -> eh_proj -> residual + layer 78 input norm
 inline void launch_draft_embed(Draft& D, int M, bool chain, cudaStream_t st)
 {
     Model& d = D.d;
     const bind::Head& H = head_for(d, M);
     if (!H.eh.on) die("the head binder has no eh_proj");
+#ifdef DEC_S2
+    const __half* hid = d.s2on ? s2_draft_hid(D, chain, st) : chain ? D.hprev : D.main_x;
+    k_mtp_in<<<dim3(2, M), 256, 0, st>>>(MtpInArgs{d.tok, d.pos, d.emb, D.enorm, D.hnorm, hid, glue::RMS_EPS, d.eh_in});
+#else
     k_mtp_in<<<dim3(2, M), 256, 0, st>>>(MtpInArgs{d.tok, d.pos, d.emb, D.enorm, D.hnorm, chain ? D.hprev : D.main_x, glue::RMS_EPS, d.eh_in});
+#endif
     bind::launch(H.xf_eh, st);
     bind::launch(H.eh, st);
     k_mtp_resid_norm<<<dim3(glue::RN_CL, M), glue::RN_T, 0, st>>>(d.eh_out, d.layers[0].attn_norm, d.resid, d.x, glue::RMS_EPS);
 }
-inline void launch_draft_keep(Draft& D, int M, cudaStream_t st) { k_mtp_keep<<<1, 256, 0, st>>>(D.d.x + (size_t)(M - 1) * HID, D.hprev); }
+inline void launch_draft_keep(Draft& D, int M, cudaStream_t st)
+{
+#ifdef DEC_S2
+    if (D.d.s2on) { s2_draft_keep(D, st); return; }
+#endif
+    k_mtp_keep<<<1, 256, 0, st>>>(D.d.x + (size_t)(M - 1) * HID, D.hprev);
+}
 // the whole draft step of one rank in stream order (real fabric)
 inline void launch_draft_step(Draft& D, int M, int context, bool chain, cudaStream_t st)
 {
     Model& d = D.d;
-    if (chain && M != 1) die("a chain draft step has one row");
+#ifdef DEC_S2
+    if (const char* e = draft_shape_error(M, chain, d.s2on, d.s2on ? s2_sessions(d) : 0)) die(e);
+#else
+    if (const char* e = draft_shape_error(M, chain, false, 0)) die(e);
+#endif
     launch_step_in(d, st);
     launch_draft_embed(D, M, chain, st);
     launch_attn_block(d, 0, M, context, st);
@@ -1206,3 +1302,6 @@ inline std::vector<int> mtp_sequence(const Plan& p, int K, u64& main_step, u64& 
 }
 
 }   // namespace g6rt
+#ifdef DEC_S2
+#include "s2.cuh"
+#endif

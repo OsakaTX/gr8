@@ -23,11 +23,19 @@
 // [--serve DIR]  requests from DIR/req.<n> until DIR/quit, rank 0 streams DIR/resp.<n> (serve.h); --prompt is ignored
 // [--top-p F] [--top-p-cands N]  nucleus sampling at T (per request with --serve); N candidates per rank per row
 //                (0 = top_p off; 256 is the served setting; misses printed at the end)
+// [--s2] (DEC_S2 build, needs --mtp, no --prefill / --serve): every --prompt is a session (<= 8) and their rows share
+//        steps (s2_batch.h mtp_batch, s2.cuh). Lines per session: "q<j> " + the solo line (step / draft / chain /
+//        round / generated), so session j's lines compare with the solo run of its prompt after the prefix is stripped
 #include <algorithm>
 #include <chrono>
 #include "packfind.h"
 #include "prefill.cuh"
 #include "serve.h"
+#ifdef DEC_S2
+#include <map>
+#include <set>
+#include "s2_batch.h"
+#endif
 
 using namespace g6rt;
 
@@ -131,6 +139,7 @@ int main(int argc, char** argv)
     int nc = 0;                         // --top-p-cands N: top_p candidates per rank per row (0 = top_p off)
     std::string qo_man, qo_file;       // --qo-manifest/--qo-pack: full-head QO weights (tools/convert/qopack.py) for G6_PF_OWN=3
     std::string mtp_dump;               // --mtp-dump PREFIX: rank 0 draft buffers of seq 0 (tools/m6/check_draft.py)
+    bool s2mode = false;                // --s2: the prompts as sessions of one batched decode (DEC_S2)
     for (int i = 1; i < argc; ++i)
     {
         const std::string a = argv[i];
@@ -158,6 +167,7 @@ int main(int argc, char** argv)
         else if (a == "--serve") serve = next();
         else if (a == "--top-p") plan.top_p = (float)atof(next().c_str());
         else if (a == "--top-p-cands") nc = atoi(next().c_str());
+        else if (a == "--s2") s2mode = true;
         else die("unknown argument " + a);
     }
     if (packs.empty()) die("usage: m4sim --packs DIR [--layers 0,3,40,77] [--prompt ids] [--gen 16] [--temp 0] [--seed 1234] [--cap 64]");
@@ -168,6 +178,11 @@ int main(int argc, char** argv)
     if (plan.chunk < 1 || plan.chunk > MX) die("--chunk must be 1..8");
     if (mtp < 0 || mtp > MX - 1) die("--mtp must be 1..7 drafts");
     if (nc < 0 || nc * 6 > glue::TP_SORT) die("--top-p-cands must be 0..341");
+#ifdef DEC_S2
+    if (s2mode && (!mtp || MP || !serve.empty() || prompts.size() > (size_t)S2N)) die("--s2 needs --mtp, no --prefill / --serve, at most 8 --prompt");
+#else
+    if (s2mode) die("--s2 needs a DEC_S2 build");
+#endif
     std::vector<Plan> plans;            // one sequence per --prompt
     std::vector<int> row_counts;
     for (const std::string& ps : prompts)
@@ -212,6 +227,17 @@ int main(int argc, char** argv)
         }
     if (cp_on) fprintf(stderr, "# G6_CP loopback: %d collectives, mmax %d, %.3f GB per rank\n", cp_colls.ncoll(), cp_mmax,
                        (cp_L.send_bytes() + cp_L.recv_bytes()) / 1e9);
+#endif
+    // --s2 on a CP build (G6_CP on): S2 below R (S2-STATE.md). Every session's run <= G6_S2_BELOW rows (default G6_CP_R,
+    // multiple of 64, <= G6_CP_R), on the CP binding as built; runs are granted by G6_S2_RUNS or the default layout
+    int s2_below = 0;
+#if defined(G6_CP) && G6_CP
+    if (s2mode && cp_on)
+    {
+        s2_below = getenv("G6_S2_BELOW") ? atoi(getenv("G6_S2_BELOW")) : cp_R;
+        if (s2_below < 64 || s2_below % 64 || s2_below > cp_R) die("--s2 with G6_CP: G6_S2_BELOW (default G6_CP_R) must be 64..G6_CP_R, a multiple of 64");
+        fprintf(stderr, "# s2 below R: runs of at most %d rows, G6_CP_R %d\n", s2_below, cp_R);
+    }
 #endif
     G6RT_CK(bind::init());
     pf_prof().on = getenv("G6_PF_PROF") != nullptr;
@@ -288,6 +314,11 @@ int main(int argc, char** argv)
 #if defined(G6_CP) && G6_CP
         R[r].cp.on = cp_on; R[r].cp.R = cp_R; R[r].cp.s3 = cp_s3; R[r].cp.colls = cp_colls;
 #endif
+#ifdef DEC_S2
+        if (s2mode && s2_below) R[r].s2_below = s2_below;       // CP: S2 below R on the CP binding as built
+        else if (s2mode) R[r].s2_pool_slots = (int)prompts.size();       // the layers' own bindings hold the S2 pool
+        if (s2mode && !s2_below && getenv("G6_S2_POOL")) R[r].s2_pool_pages = atoi(getenv("G6_S2_POOL"));   // pool pages (variable runs)
+#endif
         build(R[r], r, layers, pack_find(pack[r], store), cap, f, stepp, st, pf_attn_rows(MP));
 #if defined(G6_CP) && G6_CP
         if (cp_on)
@@ -325,6 +356,11 @@ int main(int argc, char** argv)
             g6::FabricDev fd = f;
             fd.send = dmalloc<char>(2 * (size_t)NCD * stride);
             fd.recv = recv_d; fd.doorbell = doorbell_d; fd.ncoll = NCD;
+#ifdef DEC_S2
+            if (s2mode && s2_below) DR[r].d.s2_below = s2_below;
+            else if (s2mode) DR[r].d.s2_pool_slots = (int)prompts.size();
+            if (s2mode && !s2_below && getenv("G6_S2_POOL")) DR[r].d.s2_pool_pages = atoi(getenv("G6_S2_POOL"));
+#endif
             build_draft(DR[r], R[r], pack_find(pack[r], store), cap, fd, stepp_d, st, MP ? pf_attn_rows(MP) : MX);
             DR[r].d.graph = graph; DR[r].d.in = in_d; DR[r].d.out = out_d + r;
             loop_d.send[r] = fd.send;
@@ -335,6 +371,76 @@ int main(int argc, char** argv)
     }
     for (Model& m : R) m.nc = nc;       // before any capture: the head kernels take it by value
     for (Draft& D : DR) D.d.nc = nc;
+#ifdef DEC_S2
+    S2In* in_s2 = dmalloc<S2In>(1);     // --s2: the step's session layout, target and draft steps
+    S2In* in_s2d = dmalloc<S2In>(1);
+    if (s2mode)
+    {
+        for (Model& m : R) { s2_init(m, (int)plans.size(), st); m.s2->in = in_s2; }
+        for (Draft& D : DR) { s2_init(D.d, (int)plans.size(), st); D.d.s2->in = in_s2d; }
+        // G6_S2_RUNS=b:p,b:p,..: slot q's run (base page, pages) on every model (variable runs; default: q x run, full run)
+        if (const char* e = getenv("G6_S2_RUNS"))
+        {
+            std::string r = e;
+            for (char& c : r) if (c == ':') c = ',';
+            const std::vector<int> v = parse_ints(r);
+            if (v.size() % 2 || (int)v.size() / 2 > (int)plans.size()) die("G6_S2_RUNS: base:pages per slot");
+            for (size_t k = 0; k + 1 < v.size(); k += 2)
+            {
+                for (Model& m : R) s2_set_run(m, (int)k / 2, v[k], v[k + 1]);
+                for (Draft& D : DR) s2_set_run(D.d, (int)k / 2, v[k], v[k + 1]);
+            }
+        }
+    }
+#endif
+    // P3 gate (S2-STATE.md), DEC_S2 CP build, --prefill, no --s2: G6_S2_PFBASE=B[,pages] runs every sequence as one session
+    // at base page B below R: tables B + i (s2_solo_run, main and draft), staged prefill index keys from page B
+    // (Model::s2_pf_base), StepIn::base_page = B, s2_reset_run instead of reset(). Stdout must equal the run at B = 0.
+    // G6_S2_PFPOISON=1: fill every cache with 0x3c bytes first, so a read outside the run changes the output.
+    int pf_base = 0;
+#if defined(DEC_S2) && defined(G6_CP) && G6_CP
+    int pf_pages = 0;
+    if (const char* e = getenv("G6_S2_PFBASE"))
+    {
+        const std::vector<int> v = parse_ints(e);
+        if (s2mode || !cp_on || !MP || v.empty() || v.size() > 2 || v[0] < 0) die("G6_S2_PFBASE=B[,pages]: needs G6_CP on, --prefill, no --s2");
+        pf_base = v[0];
+        const int below = getenv("G6_S2_BELOW") ? atoi(getenv("G6_S2_BELOW")) : cp_R;
+        if (below < 64 || below % 64 || below > cp_R) die("G6_S2_PFBASE: G6_S2_BELOW (default G6_CP_R) must be 64..G6_CP_R, a multiple of 64");
+        for (Model& m : R) { m.s2_below = below; s2_init(m, 1, st); }
+        for (Draft& D : DR) { D.d.s2_below = below; s2_init(D.d, 1, st); }
+        pf_pages = v.size() > 1 ? v[1] : std::min(R[0].s2->run_pages, R[0].s2->pool_pages - pf_base);
+        for (const Draft& D : DR) if (v.size() < 2) pf_pages = std::min(pf_pages, D.d.s2->pool_pages - pf_base);
+        if (getenv("G6_S2_PFPOISON"))
+        {
+            auto poison = [&](Model& m) {
+                for (const Layer& y : m.layers)
+                {
+                    const G6Attn& a = y.ab.args;
+                    G6RT_CK(cudaMemsetAsync(a.mla_cache, 0x3c, (size_t)a.page_count * 64 * 656, st));
+                    if (a.index_cache) G6RT_CK(cudaMemsetAsync(a.index_cache, 0x3c, (size_t)std::max(a.page_count, a.table_size) * 64 * 132, st));
+                }
+            };
+            for (Model& m : R) poison(m);
+            for (Draft& D : DR) poison(D.d);
+        }
+        // G6_S2_PFNOFIX=1 (negative control): tables at B but staged index keys from page 0 (before 4c2596b); must differ
+        const int ixb = getenv("G6_S2_PFNOFIX") ? 0 : pf_base;
+        for (Model& m : R) { s2_solo_run(m, pf_base, pf_pages); m.s2on = false; m.s2_pf_base = ixb; }
+        for (Draft& D : DR) { s2_solo_run(D.d, pf_base, pf_pages); D.d.s2on = false; D.d.s2_pf_base = ixb; }
+        G6RT_CK(cudaStreamSynchronize(st));
+        fprintf(stderr, "# s2 P3 gate: every sequence at base page %d, run of %d pages (main pool %d pages)%s%s\n", pf_base, pf_pages,
+                R[0].s2->pool_pages, getenv("G6_S2_PFPOISON") ? ", caches poisoned 0x3c" : "", ixb != pf_base ? ", NOFIX" : "");
+    }
+#endif
+    // StepIn to the device; G6_S2_PFBASE: the run's base page
+    auto put_in = [&](StepIn* dst, const StepIn& si) {
+        StepIn x = si;
+#ifdef DEC_S2
+        if (pf_base) x.base_page = pf_base;
+#endif
+        G6RT_CK(cudaMemcpy(dst, &x, sizeof x, cudaMemcpyHostToDevice));
+    };
     loop_d.recv = recv_d; loop_d.stepp = stepp_d; loop_d.ncoll = NCD; loop_d.stride = stride;
     loop.recv = recv; loop.stepp = stepp; loop.ncoll = NC; loop.stride = stride;
     loop_pf.recv = recv_pf; loop_pf.stepp = stepp_pf; loop_pf.ncoll = NCP; loop_pf.stride = stride_pf;
@@ -612,7 +718,7 @@ int main(int argc, char** argv)
             else if (graph) capture([&] { enqueue(M, si.context); }, &exec[k][M], "target", M);
             ready[k][M] = true;
         }
-        G6RT_CK(cudaMemcpy(in, &si, sizeof si, cudaMemcpyHostToDevice));
+        put_in(in, si);
         const auto t0 = std::chrono::steady_clock::now();
         if (graph) launch_main(k, M);
         else enqueue(M, si.context);
@@ -631,7 +737,7 @@ int main(int argc, char** argv)
             if (graph) capture([&] { enqueue_draft(M, si.context, chain); }, &exec_d[k][chain][M], chain ? "chain draft" : "first draft", M);
             ready_d[k][chain][M] = true;
         }
-        G6RT_CK(cudaMemcpy(in_d, &si, sizeof si, cudaMemcpyHostToDevice));
+        put_in(in_d, si);
         const auto t0 = std::chrono::steady_clock::now();
         if (graph) G6RT_CK(cudaGraphLaunch(exec_d[k][chain][M], st));
         else enqueue_draft(M, si.context, chain);
@@ -702,6 +808,233 @@ int main(int argc, char** argv)
     std::vector<int> hist;              // --reuse-prefix: the tokens of the previous sequence, prompt + generated
     Emitter em;
     PfTimes pt;                         // G6_PF_TIMES=1 (serve.h)
+#ifdef DEC_S2
+    if (s2mode)                         // --s2: all prompts as sessions of one batched decode
+    {
+        for (Model& m : R) { reset(m, st); s2_reset(m, st); }
+        for (Draft& D : DR) { reset(D.d, st); s2_reset(D.d, st); }
+        G6RT_CK(cudaStreamSynchronize(st));
+        const int NSS = (int)plans.size();
+        std::vector<s2::Session> SS;
+        for (const Plan& p : plans)
+        {
+            s2::Session x;
+            x.prompt = p.prompt; x.chunk = p.chunk; x.n_gen = p.n_gen;
+            SS.push_back(x);
+            printf("q%zu seq 0 prompt %zu tokens\n", SS.size() - 1, p.prompt.size());
+        }
+        int solo = -1, solo_base = 0;    // S=1 on today's path: the session's slot (-1 = S2 path), its run's base page
+        std::map<std::string, cudaGraphExec_t> gx;   // graph form: per step layout (s2_batch.h Step::key + buckets + sources)
+        std::set<std::string> prepped;
+        std::vector<int> ms(NSS, 0), cj(NSS, 0), mrow0(NSS, 0);
+        u64 mstep = 0, dstep2 = 0;
+        size_t free0 = 0, total = 0;
+        G6RT_CK(cudaMemGetInfo(&free0, &total));
+        std::map<std::pair<int, int>, std::vector<double>> tk;   // (kind, M) -> step wall ms
+        // B4 probe only (measurement): G6_S2_CLS=c runs every step at k1 row class c; G6_S2_ROWHASH=1 adds one line per
+        // target row: "q<j> row <pos> resid <fnv of the row> lpt <bits>" (rank 0)
+        static const int force_cls = getenv("G6_S2_CLS") ? atoi(getenv("G6_S2_CLS")) : 0;
+        static const bool rowhash = getenv("G6_S2_ROWHASH") != nullptr;
+        if (force_cls) fprintf(stderr, "# G6_S2_CLS=%d: every step at k1 row class %d (probe)\n", force_cls, force_cls);
+        s2::Hooks hk;
+        hk.run = [&](const s2::Step& sp) {
+            const bool draft = sp.kind != s2::Step::MAIN, chain = sp.kind == s2::Step::CHAIN;
+            const int M = sp.M();
+            StepIn si;
+            memset(&si, 0, sizeof si);
+            si.step = draft ? ++dstep2 : ++mstep;
+            si.M = M;
+            for (int r = 0; r < M; ++r)
+            {
+                si.tok[r] = sp.r[r].tok; si.pos[r] = sp.r[r].pos; si.tgt[r] = sp.r[r].tgt;
+                si.srow[r] = glue::SampleRow{plan.inv_temp, plan.seed, 0u, sp.r[r].spos, 0, plan.top_p};
+            }
+            S2In h;
+            memset(&h, 0, sizeof h);
+            h.ns = (int)sp.sess.size(); h.cls = force_cls ? force_cls : sp.cls;
+            for (int j = 0; j < h.ns; ++j)
+            {
+                h.sess[j] = sp.sess[j]; h.row0[j] = sp.row0[j]; h.rows[j] = sp.rows[j]; h.ctx[j] = sp.ctx[j];
+                si.context = std::max(si.context, sp.ctx[j]);
+            }
+            for (int j = 0; j < h.ns; ++j)
+            {
+                const S2Model& s2m = *(draft ? DR[0].d : R[0]).s2;
+                h.base[j] = s2m.base[h.sess[j]];
+                if (h.ctx[j] > s2m.pages[h.sess[j]] * 64) die("s2: session context past its run (G6_S2_RUNS grant)");   // caller's grant check
+            }
+            std::string key = sp.key();
+            auto set = [&](Model& m, bool first) {
+                m.s2->h = h;
+                for (int j = 0; j < h.ns; ++j)
+                {
+                    m.s2->bk[h.sess[j]] = bucket_of(m, h.ctx[j]);
+                    m.s2->src0[j] = mrow0[h.sess[j]];
+                    if (first) key += ":b" + std::to_string(m.s2->bk[h.sess[j]]) + "p" + std::to_string(h.base[j]) +
+                                      (draft && !chain ? "s" + std::to_string(m.s2->src0[j]) : "");
+                }
+            };
+            if (draft) for (Draft& D : DR) set(D.d, D.d.rank == 0);
+            else for (Model& m : R) set(m, m.rank == 0);
+            StepOut so[NR];
+            if (solo >= 0)                  // S=1: today's path and graphs (run_main / run_draft), the run at solo_base
+            {
+                si.base_page = solo_base;
+                const double w = draft ? run_draft(si, chain, so) : run_main(si, so);
+                tk[{(int)sp.kind + 3, M}].push_back(w);
+            }
+            else
+            {
+                if (!prepped.count(key))
+                {
+                    if (draft) for (Draft& D : DR) s2_prepare(D.d, M, st);
+                    else for (Model& m : R) s2_prepare(m, M, st);
+                    G6RT_CK(cudaStreamSynchronize(st));
+                    if (graph)
+                    {
+                        cudaGraphExec_t ex;
+                        if (draft) capture([&] { enqueue_draft(M, si.context, chain); }, &ex, ("s2 " + key).c_str(), M);
+                        else if (gsplit)            // DEC_GSPLIT as the solo target step: parts A (step in .. layers < ls), B
+                        {
+                            cudaGraphExec_t ex2;
+                            capture([&] { enqueue(M, si.context, 0, gsplit); }, &ex, ("s2 split part A " + key).c_str(), M);
+                            capture([&] { enqueue(M, si.context, 1, gsplit); }, &ex2, ("s2 split part B " + key).c_str(), M);
+                            gx[key + "|B"] = ex2;
+                        }
+                        else capture([&] { enqueue(M, si.context); }, &ex, ("s2 " + key).c_str(), M);
+                        gx[key] = ex;
+                    }
+                    prepped.insert(key);
+                }
+                G6RT_CK(cudaMemcpy(draft ? in_d : in, &si, sizeof si, cudaMemcpyHostToDevice));
+                G6RT_CK(cudaMemcpy(draft ? in_s2d : in_s2, &h, sizeof h, cudaMemcpyHostToDevice));
+                const auto t0 = std::chrono::steady_clock::now();
+                if (graph)
+                {
+                    G6RT_CK(cudaGraphLaunch(gx[key], st));
+                    if (gsplit && !draft) G6RT_CK(cudaGraphLaunch(gx[key + "|B"], st));
+                }
+                else if (draft) enqueue_draft(M, si.context, chain);
+                else enqueue(M, si.context);
+                G6RT_CK(cudaStreamSynchronize(st));
+                tk[{(int)sp.kind, M}].push_back(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+                check_fabric(draft ? "s2 draft" : "s2 target");
+                G6RT_CK(cudaMemcpy(so, draft ? out_d : out, NR * sizeof(StepOut), cudaMemcpyDeviceToHost));
+            }
+            for (int r = 0; r < NR; ++r)
+                if (so[r].attn_err) { fprintf(stderr, "m4sim: attention error word %08x, rank %d, s2 step %s\n", so[r].attn_err, r, key.c_str()); exit(3); }
+            for (int j = 0; j < h.ns; ++j)
+            {
+                const int q = h.sess[j];
+                int s;
+                if (!draft) { s = ms[q]++; mrow0[q] = h.row0[j]; }
+                else if (!chain) { s = ms[q] - 1; cj[q] = 0; }
+                else s = ++cj[q];
+                const std::string prefix = "q" + std::to_string(q) + " " + (chain ? "chain" : draft ? "draft" : "step");
+                std::string line0;
+                for (int r = 0; r < NR; ++r)
+                {
+                    std::string line;
+                    s2_step_line(draft ? DR[r].d : R[r], so[r], s, h.row0[j], h.rows[j], line);
+                    line = prefix + line.substr(4);
+                    if (r == 0) line0 = line;
+                    else if (line != line0) { ++bad; printf("RANK %d DIFFERS: %s\n", r, line.c_str()); }
+                }
+                printf("%s\n", line0.c_str());
+                if (rowhash && !draft)
+                    for (int r = h.row0[j]; r < h.row0[j] + h.rows[j]; ++r)
+                    {
+                        std::vector<float> v(HID);
+                        G6RT_CK(cudaMemcpy(v.data(), R[0].resid + (size_t)r * HID, HID * 4, cudaMemcpyDeviceToHost));
+                        uint32_t u;
+                        memcpy(&u, &so[0].lpt[r], 4);
+                        printf("q%d row %d resid %016llx lpt %08x\n", q, si.pos[r], (unsigned long long)fnv(0xcbf29ce484222325ull, v.data(), HID * 4), u);
+                    }
+            }
+            if (!draft) ++steps;
+            return std::vector<int>(so[0].tok, so[0].tok + M);
+        };
+        hk.round = [&](int q, long rd, int base, int a, int K) { printf("q%d round %ld base %d accepted %d of %d\n", q, rd, base, a, K); };
+        // S=1 transition contract (joint TP6 + TP4 ruling, TP4 option (a), provisional): a session alone (fresh, or the
+        // survivor of 2 -> 1) runs today's path (s2on off on every model, the layers' own bindings, D.hprev, today's graphs)
+        // with its run where it is: the layers' tables = base + i (s2_solo_base), StepIn::base_page = base.
+        // G6_S2_SOLO1=0: stay on the S2 path at S=1 (screen). G6_S2_RELOC=1: the fallback, relocate the survivor to base 0.
+        // G6_S2_GEN=a,b,..: per-session --gen (so the sessions finish at different rounds and 2 -> 1 happens).
+        const bool solo1 = !getenv("G6_S2_SOLO1") || atoi(getenv("G6_S2_SOLO1")) != 0;
+        const bool reloc = getenv("G6_S2_RELOC") && atoi(getenv("G6_S2_RELOC")) != 0;
+        if (const char* e = getenv("G6_S2_GEN"))
+        {
+            const std::vector<int> g = parse_ints(e);
+            for (int q = 0; q < NSS && q < (int)g.size(); ++q) SS[q].n_gen = g[q];
+        }
+        auto go_solo = [&](int q) {
+            const auto t0 = std::chrono::steady_clock::now();
+            const int B = R[0].s2->base[q];
+            int pages = 0;
+            if (reloc && B)
+            {
+                for (int k = 0; k < NSS; ++k) pages = std::max(pages, (int)SS[k].prompt.size() + SS[k].n_gen + 2 * mtp + 63);
+                pages = std::min(pages / 64, R[0].s2->pages[q]);
+                if (const char* e = getenv("G6_S2_RELOC_PAGES")) pages = std::min(atoi(e), R[0].s2->pages[q]);   // stall timing: copy N pages
+                for (Model& m : R) s2_relocate(m, q, pages, st);
+                for (Draft& D : DR) s2_relocate(D.d, q, pages, st);
+            }
+            solo_base = R[0].s2->base[q];
+            const int solo_pages = R[0].s2->pages[q];
+            for (Model& m : R) { s2_solo_run(m, solo_base, solo_pages); m.s2on = false; }
+            for (Draft& D : DR) { s2_solo_run(D.d, solo_base, solo_pages); s2_hprev_to_solo(D, q, st); D.d.s2on = false; }
+            G6RT_CK(cudaStreamSynchronize(st));
+            solo = q;
+            fprintf(stderr, "# s2 -> S=1: session %d alone, run at base page %d (was %d), %s %d pages; %.3f ms (tables%s, hprev)\n", q, solo_base, B,
+                    reloc && B ? "relocated" : "no copy,", pages, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count(),
+                    reloc && B ? " + relocation" : "");
+        };
+        std::vector<s2::Stats> sst(NSS);
+        std::vector<std::vector<int>> gen(NSS);
+        {
+            s2::Batch b(mtp, MX, hk);
+            std::vector<int> qs(NSS);
+            for (int q = 0; q < NSS; ++q) qs[q] = q;
+            if (solo1 && NSS == 1) go_solo(0);
+            b.admit(qs, SS);
+            for (;;)
+            {
+                std::vector<int> act;
+                for (int q : qs) if (b.active(q)) act.push_back(q);
+                if (act.empty()) break;
+                if (solo1 && solo < 0 && act.size() == 1) go_solo(act[0]);
+                b.round(qs);
+            }
+            for (int q = 0; q < NSS; ++q) { gen[q] = b.result(q); sst[q] = b.stats(q); }
+        }
+        for (int q = 0; q < NSS; ++q)
+        {
+            printf("q%d generated", q);
+            for (int t : gen[q]) printf(" %d", t);
+            printf("\n");
+            long tok = 0, rounds = sst[q].rounds;
+            tok = sst[q].tokens;
+            fprintf(stderr, "# s2 session %d: %ld rounds, %ld tokens, accepted", q, rounds, tok);
+            for (size_t a = 0; a < sst[q].acc.size(); ++a) fprintf(stderr, " %zu:%ld", a, sst[q].acc[a]);
+            fprintf(stderr, "\n");
+        }
+        size_t free1 = 0;
+        G6RT_CK(cudaMemGetInfo(&free1, &total));
+        fprintf(stderr, "# s2: %zu step layouts (%s), device free memory %.1f MiB lower after them (graphs, replay entries, bound layers)\n",
+                prepped.size(), graph ? "graphs" : "plain launches", ((double)free0 - (double)free1) / 1048576.0);
+        static const char* kn[6] = {"verify/prompt", "first draft", "chain", "S=1 today's path verify/prompt", "S=1 today's path first draft",
+                                    "S=1 today's path chain"};
+        for (auto& kv : tk)
+        {
+            std::vector<double> v = kv.second;
+            std::sort(v.begin(), v.end());
+            fprintf(stderr, "# s2 %s steps M=%d: %zu, p50 %.3f ms min %.3f ms (six ranks in turn)\n", kn[kv.first.first], kv.first.second, v.size(),
+                    v[v.size() / 2], v[0]);
+        }
+        printf("# m4sim: %d steps, %d rank lines differ from rank 0\n", steps, bad);
+        return bad ? 1 : 0;
+    }
+#endif
     if (!serve.empty()) serve_ready(serve);
     for (size_t q = 0;; ++q)
     {
@@ -738,8 +1071,18 @@ int main(int argc, char** argv)
         }
         if (!skip)
         {
-            for (Model& m : R) reset(m, st);
-            for (Draft& D : DR) reset(D.d, st);
+#if defined(DEC_S2) && defined(G6_CP) && G6_CP
+            if (getenv("G6_S2_PFBASE"))         // P3 gate: clear the run only (s2_reset_run)
+            {
+                for (Model& m : R) s2_reset_run(m, pf_base, pf_pages, st);
+                for (Draft& D : DR) s2_reset_run(D.d, pf_base, pf_pages, st);
+            }
+            else
+#endif
+            {
+                for (Model& m : R) reset(m, st);
+                for (Draft& D : DR) reset(D.d, st);
+            }
         }
         if (p.first < skip) p.first = skip;
         if (serve.empty()) pt.start("");
@@ -973,7 +1316,7 @@ int main(int argc, char** argv)
                     }
                 ready[k][M] = true;
             }
-            G6RT_CK(cudaMemcpy(in, &si, sizeof si, cudaMemcpyHostToDevice));
+            put_in(in, si);
             const auto t0 = std::chrono::steady_clock::now();
             if (graph) launch_main(k, M);
             else enqueue(M, si.context);

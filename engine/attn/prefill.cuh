@@ -7,6 +7,7 @@
 #include <climits>
 #include <cstdlib>
 #include "prefill-index-team-profile.cuh"
+#include "selx.cuh"
 #ifndef G6_PF_MARK
 #define G6_PF_MARK(stage, stream) ((void)0)
 #endif
@@ -214,6 +215,27 @@ static ga::Work index_workspace(const G6Attn& a,void* base,bool full){
         w.temp_bytes=std::max(bytes,single);w.temp=take(w.temp_bytes);}
     w.total=used;return w;
 }
+// G6_PF_SELX_CTX (selx.cuh = tp6-spare 446fa62, shared with TP4 verbatim): prefill index tiles with n >= SELX_MINN rows and context
+// >= this select with selx (one CTA per row, sample bound + filter + radix + sort) instead of SEL32: the same ids in the same
+// order (score desc, then id asc, -1 fill). Unset = SEL32 for every tile (today). Strict: an integer 32769..1048576, else exit 2.
+// cand scratch = w.so .. w.io (2 * R * T * 4 B, present for T > 32768, used by SEL32 only as its histogram) -> min(CAPG, T) keys/row.
+static constexpr int SELX_MINN=32;   // our gate: selx 1.6-2.0x SEL32 from 53K at n >= 33
+static int selx_ctx(){
+    static const int v=[]{const char* s=getenv("G6_PF_SELX_CTX");if(!s)return 0;
+        char* e=nullptr;errno=0;const long x=strtol(s,&e,10);
+        if(!*s||*e||errno||x<=32768||x>1048576){fprintf(stderr,"G6_PF_SELX_CTX='%s': need an integer 32769..1048576 (unset = SEL32)\n",s);exit(2);}
+        fprintf(stderr,"# G6_PF_SELX_CTX %ld: prefill index tiles with n >= %d and context >= %ld select with selx\n",x,SELX_MINN,x);return (int)x;}();
+    return v;
+}
+static cudaError_t select_prefill(const G6Attn& a,ga::Work& w,int start,int n,cudaStream_t st){
+    static_assert(selx::TOP==TOP,"selx TOP");
+#ifdef SEL32
+    const int c=selx_ctx();
+    if(c&&n>=SELX_MINN&&a.context>=c&&a.context>32768&&w.so)
+        return selx::select(w.si,a.context,a.context,nullptr,n,a.indices+(int64_t)start*TOP,(uint64_t*)w.so,std::min(selx::CAPG,a.context),nullptr,st);
+#endif
+    return ga::select_index(a,w,start,n,st);
+}
 static size_t weight_layout(G6AttnPrefill& p,void* base){
     const size_t uk_bytes=(size_t)p.H*512*192*2,uv_bytes=(size_t)p.H*256*512*2;
     p.uk=(half*)base;p.uv=(half*)((uintptr_t)base+uk_bytes);return uk_bytes+uv_bytes;
@@ -304,7 +326,7 @@ extern "C" int g6_attn_bind_prefill_trace(G6AttnPrefill* p,G6AttnBinding* b,cons
             G6_PF_MARK(3,st);gp::index_scores_grouped<<<dim3((a.context+63)/64,(n+3)/4),256,0,st>>>(a,start,n,w.iq,w.weights,p->ikey,p->kscale,w.si,w.ii);
 #endif
             if(tr.index_scores)cudaMemcpyAsync(tr.index_scores+(int64_t)start*a.context,w.si,(size_t)n*a.context*4,cudaMemcpyDeviceToDevice,st);
-            G6_PF_MARK(4,st);auto e=ga::select_index(a,w,start,n,st);if(e!=cudaSuccess)return int(e);
+            G6_PF_MARK(4,st);auto e=gp::select_prefill(a,w,start,n,st);if(e!=cudaSuccess)return int(e);
         }
         GP_PROFILE();G6_PF_MARK(5,st);gp::pack_uk_input<<<(H*R*192+255)/256,256,0,st>>>(a,start,n,R,p->q);GP_BLAS(cublasGemmStridedBatchedEx(p->blas,CUBLAS_OP_T,CUBLAS_OP_N,512,R,192,&one,p->uk,CUDA_R_16F,192,512*192,
             p->q,CUDA_R_16F,576,(long long)R*576,&zero,p->qf,CUDA_R_32F,512,(long long)R*512,H,CUBLAS_COMPUTE_32F,CUBLAS_GEMM_DEFAULT_TENSOR_OP));

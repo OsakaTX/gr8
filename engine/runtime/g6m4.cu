@@ -17,12 +17,21 @@
 //      [--serve DIR]  requests from DIR/req.<n> until DIR/quit, rank 0 streams DIR/resp.<n> (serve.h); --prompt is ignored
 //      [--top-p F] [--top-p-cands N]  nucleus sampling at T (per request with --serve); N candidates per rank per row
 //                     (0 = top_p off; 256 is the served setting; misses printed at the end)
+//      [--s2 DIR --s2-port N [--s2-sessions S] [--s2-epoch E]]  (DEC_S2 + G6_CP build) S2 below R served: up to S sessions
+//                     share decode steps (runs of at most G6_S2_BELOW rows, default G6_CP_R), a longer request runs alone at
+//                     base 0 of the pool (s2/pool.h); requests over the control sockets (s2/service.h, head = rank 0 on
+//                     --ips[0]:N); DIR is this rank's fresh S2 directory (cmd.<n> / req.<n> / resp.<n>, ready.s2, status.s2).
+//                     Needs --graph, --mtp, --prefill, G6_DEC_SPLIT=3; no --serve; --prompt is ignored.
 #include <algorithm>
 #include <chrono>
 #include "packfind.h"
 #include "prefill.cuh"
 #include "serve.h"
 #include "../comms/fabric.h"
+#ifdef DEC_S2
+#include "s2/native.cuh"
+#include "s2/pool.h"
+#endif
 
 using namespace g6rt;
 
@@ -52,6 +61,9 @@ int main(int argc, char** argv)
     int pfrows = 0, mtp = 0, lanes = 1;
     std::string serve;
     int nc = 0;                         // --top-p-cands N: top_p candidates per rank per row (0 = top_p off)
+    std::string s2dir;                  // --s2 DIR: S2 below R served (DEC_S2)
+    int s2port = 0, s2sess = 8;
+    unsigned long long s2epoch = 1;
     for (int i = 1; i < argc; ++i)
     {
         const std::string a = argv[i];
@@ -84,6 +96,10 @@ int main(int argc, char** argv)
         else if (a == "--serve") serve = next();
         else if (a == "--top-p") plan.top_p = (float)atof(next().c_str());
         else if (a == "--top-p-cands") nc = atoi(next().c_str());
+        else if (a == "--s2") s2dir = next();
+        else if (a == "--s2-port") s2port = atoi(next().c_str());
+        else if (a == "--s2-sessions") s2sess = atoi(next().c_str());
+        else if (a == "--s2-epoch") s2epoch = strtoull(next().c_str(), nullptr, 10);
         else die("unknown argument " + a);
     }
     if (cfg.rank < 0 || cfg.ips.size() != 6 || manifest.empty() || packfile.empty())
@@ -95,6 +111,12 @@ int main(int argc, char** argv)
     if (plan.chunk < 1 || plan.chunk > MX) die("--chunk must be 1..8");
     if (mtp < 0 || mtp > MX - 1) die("--mtp must be 1..7 drafts");
     if (nc < 0 || nc * 6 > glue::TP_SORT) die("--top-p-cands must be 0..341");
+    const bool s2mode = !s2dir.empty();
+#ifndef DEC_S2
+    if (s2mode) die("--s2 needs a DEC_S2 build");
+#endif
+    if (s2mode && (!serve.empty() || !graph || !mtp || !MP || s2port < 1 || s2port > 65535 || s2sess < 1 || s2sess > 8 || !s2epoch))
+        die("--s2 needs --graph, --mtp, --prefill, --s2-port 1..65535, --s2-sessions 1..8, --s2-epoch > 0 and no --serve");
     std::vector<Plan> plans;            // one sequence per --prompt
     std::vector<int> row_counts;
     for (const std::string& ps : prompts)
@@ -109,7 +131,7 @@ int main(int argc, char** argv)
             if (std::find(row_counts.begin(), row_counts.end(), M) == row_counts.end()) row_counts.push_back(M);
         plans.push_back(p);
     }
-    if (!serve.empty())                 // any prompt: every prompt-step row count 1..chunk
+    if (!serve.empty() || s2mode)       // any prompt: every prompt-step row count 1..chunk
         for (int M = 1; M <= plan.chunk; ++M)
             if (std::find(row_counts.begin(), row_counts.end(), M) == row_counts.end()) row_counts.push_back(M);
     std::vector<int> draft_rows;        // row counts of first-form draft passes: the prompt steps' and 1..K+1
@@ -312,6 +334,25 @@ int main(int argc, char** argv)
         DQ.P.attn_rows = pf_attn_rows(MP);
         if (MP) build_draft_prefill(DQ, D, find, MP, fp, pfv2, st, &P);
     }
+#ifdef DEC_S2
+    // --s2: S2 below R on the CP binding (S2-STATE.md v1). Session views on the pool, main and draft; today's graphs below
+    // are captured with s2on off (the S = 1 path), the S2 graphs later by s2/native.cuh with s2on on.
+    int s2_below = 0;
+    if (s2mode)
+    {
+#if defined(G6_CP) && G6_CP
+        if (!cp_on || !cp_R) die("--s2: S2 below R needs G6_CP on and G6_CP_R");
+        s2_below = getenv("G6_S2_BELOW") ? atoi(getenv("G6_S2_BELOW")) : cp_R;
+        if (s2_below < 64 || s2_below % 64 || s2_below > cp_R) die("--s2: G6_S2_BELOW (default G6_CP_R) must be 64..G6_CP_R, a multiple of 64");
+#else
+        die("--s2: v1 is S2 below R on the CP binding (a G6_CP build)");
+#endif
+        m.s2_below = D.d.s2_below = s2_below;
+        s2_init(m, s2sess, st);
+        s2_init(D.d, s2sess, st);
+        m.s2on = D.d.s2on = false;
+    }
+#endif
     u64 ls0 = 1;
     double pf_ms = 0;
     long pf_rows = 0;
@@ -324,6 +365,7 @@ int main(int argc, char** argv)
     // exec2 = the rest; launched back to back, the second graph's submission overlaps the first one's GPU time (0 = one graph)
     const int gsplit = getenv("G6_DEC_SPLIT") ? atoi(getenv("G6_DEC_SPLIT")) : 0;
     if (gsplit < 0 || gsplit >= NL || (gsplit && !graph)) die("G6_DEC_SPLIT must be 0..layers-1 and needs --graph");
+    if (s2mode && gsplit != 3) die("--s2 needs G6_DEC_SPLIT=3 (the production split3 graphs)");
     cudaGraphExec_t exec2[NBK][MX + 1] = {};
     auto launch_main = [&](int k, int M) {
         G6RT_CK(cudaGraphLaunch(exec[k][M], st));
@@ -375,6 +417,103 @@ int main(int argc, char** argv)
     fab.barrier();
     if (R == 0) printf("# m4 layers %s, %zu sequences, chunks of %d, gen %d temp %g seed %u\n", layers_s.c_str(), plans.size(), plan.chunk, plan.n_gen, temp, plan.seed);
 
+#ifdef DEC_S2
+    if (s2mode)
+    {
+        // S2 below R served loop (replaces the request loop below). Pool: logical capacity = cap (a past-R request alone at
+        // base 0 reads the table as built), runs below R placed in the physical pages every rank and model has.
+        g6s2::Config sc;
+        sc.epoch = s2epoch;
+        sc.pool_rows = (uint32_t)(cap / 64 * 64);
+        sc.max_rows = MX;
+        sc.max_sessions = (uint32_t)s2sess;
+        sc.mtp = (uint32_t)mtp;
+        sc.prefill_rows = (uint32_t)MP;
+        sc.two_lanes = two;
+        sc.group_rows = true;            // S = 3, 4 run as row groups ("grouped, 2 steps/round"; S2-STATE.md)
+        const int place = std::min(m.s2->pool_pages, D.d.s2->pool_pages);
+        g6s2::RunPool pool((uint32_t)(cap / 64), (uint32_t)place, (uint32_t)s2_below);
+        m.s2on = D.d.s2on = true;        // no session: the adapter starts in S2 mode (solo -1)
+        G6RT_CK(cudaStreamSynchronize(st));
+        g6s2::NativeContext nx{m, D, P, P2, DQ, fab, fabd, fabp, fabp2, st, pf_streams ? &lanes2 : nullptr, in, in_d, out, out_d, MP, gsplit, two,
+            [&](unsigned long long step, int M, int context) {
+                std::vector<uint32_t> sizes(NC, (uint32_t)(M * HID * 2));
+                sizes[2 * NL] = (uint32_t)glue::head_bytes(M, nc);
+                fab.enqueue_step(step, sizes);
+                cp_enqueue(step, M, context);
+            },
+            [&](int k, int M) {
+                g6s2::require(k >= 0 && k < m.nbk && M >= 1 && M <= MX && exec[k][M] && exec2[k][M], "S=1 target graph not captured");
+                launch_main(k, M);
+            },
+            [&](int k, bool chain, int M) {
+                g6s2::require(k >= 0 && k < D.d.nbk && M >= 1 && M <= MX && exec_d[k][chain][M], "S=1 draft graph not captured");
+                G6RT_CK(cudaGraphLaunch(exec_d[k][chain][M], st));
+            },
+            [&](const g6s2::Slot& sl) {      // the run's tables on the layers' own bindings + staged index keys from its base
+                const bool ex = pool.exclusive(g6s2::reserve_rows(sc, sl.req));
+                const int B = ex ? 0 : (int)sl.run.base_page, pg = ex ? m.s2->run_pages : (int)sl.run.pages;
+                s2_solo_run(m, B, pg); s2_solo_run(D.d, B, pg);
+                m.s2_pf_base = D.d.s2_pf_base = B;
+            },
+            [&]() { m.s2_pf_base = D.d.s2_pf_base = 0; },
+            [&]() { cp_pf_in(); }, [&]() { cp_pf_out(); },
+            [&]() -> unsigned { return cp_error() | cp_pf_err(); }};
+        try
+        {
+            g6s2::NativeDispatch nd(nx, sc);
+            g6s2::NativeHooks h;
+            h.pool.free_pages = [&] { return pool.free_pages(); };
+            h.pool.largest_run = [&] { return pool.largest_run(); };
+            h.pool.reserve = [&](uint64_t rows) { return pool.reserve(rows); };
+            h.pool.claim = [&](const g6s2::Run& r, uint64_t rows) { pool.claim(r, rows); };
+            h.pool.release = [&](const g6s2::Run& r) { pool.release(r); };
+            h.pool.admissible = [&](uint64_t rows) { return pool.admissible(rows); };
+            h.bind = [&](const g6s2::Grant& g) {     // at the admission fence, every rank, main and draft
+                const int q = (int)g.key.slot;
+                const bool ex = pool.exclusive(g6s2::reserve_rows(sc, g.req));
+                for (Model* x : {&m, &D.d})
+                {
+                    if (ex) { s2_set_run(*x, q, 0, x->s2->run_pages); reset(*x, st); }   // alone: the whole pool, today's reset
+                    else { s2_set_run(*x, q, (int)g.run.base_page, (int)g.run.pages); s2_reset_run(*x, (int)g.run.base_page, (int)g.run.pages, st); }
+                    for (int l = 0; l < x->nl; ++l)  // slot q's views (s2_reset, one slot)
+                    {
+                        const G6AttnBinding* v = x->s2->sab[l][q];
+                        G6RT_CK(cudaMemsetAsync(v->args.indices, 0xff, (size_t)v->max_rows * 2048 * 4, st));
+                        G6RT_CK(cudaMemsetAsync(v->args.output, 0, (size_t)v->max_rows * v->args.heads * 256 * 2, st));
+                        G6RT_CK(cudaMemsetAsync(v->args.error, 0, 4, st));
+                    }
+                }
+                G6RT_CK(cudaStreamSynchronize(st));
+            };
+            h.retire = [&](const g6s2::Slot& old) { nd.retire(old); };
+            h.fence = [&] { nd.synchronize(); };
+            h.dispatch = nd.hooks();
+            g6s2::BootstrapConfig bc;
+            bc.scheduler = sc;
+            bc.rank = (unsigned)R;
+            bc.ranks = (unsigned)cfg.ips.size();
+            bc.timeout = getenv("G6_S2_TIMEOUT") ? (unsigned)atoi(getenv("G6_S2_TIMEOUT")) : 120;
+            bc.head_ip = cfg.ips[0];
+            bc.directory = s2dir;
+            bc.port = (uint16_t)s2port;
+            bc.runtime_signature = "g6m4 s2 below " + std::to_string(s2_below) + " cap " + std::to_string(cap) + " layers " + layers_s +
+                " mp " + std::to_string(MP) + " lanes " + std::to_string(two ? 2 : 1) + " mtp " + std::to_string(mtp) + " chunk " +
+                std::to_string(plan.chunk) + " cands " + std::to_string(nc) + " split 3";
+            fprintf(stderr, "# rank %d: s2 below R %d rows, pool %u logical / %d physical pages, %d sessions, epoch %llu, control %s:%d\n", R,
+                    s2_below, sc.pool_rows / 64, place, s2sess, s2epoch, bc.head_ip.c_str(), s2port);
+            g6s2::ControlLinks links = g6s2::bootstrap(bc);
+            g6s2::Service service(bc, links, std::move(h), plan.chunk);
+            service.run();               // returns on DIR/quit
+            links.shutdown();
+        }
+        catch (const std::exception& e)
+        {
+            fprintf(stderr, "g6m4: rank %d S2 epoch failed: %s\n", R, e.what());
+            exit(3);
+        }
+    }
+#endif
     u64 step0 = 0, dstep = 0;
     MtpStats mtp_stats;
     int mtp_steps = 0;
@@ -382,7 +521,7 @@ int main(int argc, char** argv)
     Emitter em;
     PfTimes pt;                         // G6_PF_TIMES=1 (serve.h)
     if (!serve.empty()) serve_ready(serve);
-    for (size_t q = 0;; ++q)
+    for (size_t q = 0; !s2mode; ++q)
     {
         Plan sp;
         if (serve.empty())

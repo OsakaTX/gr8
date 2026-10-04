@@ -90,6 +90,30 @@ __global__ void __launch_bounds__(256) k_vget(g6::VSlotDev v, int j, const u64* 
     if (blockIdx.x == 0 && threadIdx.x < (n % 16) / 4)
         reinterpret_cast<unsigned*>(reinterpret_cast<uint4*>(dst) + n / 16)[threadIdx.x] = reinterpret_cast<const unsigned*>(src + n / 16)[threadIdx.x];
 }
+#ifdef CP_F1A
+// F1a: the phase-2 partial waits + gets of launch_attn_cp (one k_vwait + one k_vget per partial) as ONE launch.
+// grid (G, n), block 256: row y waits for partial collective v[y] (its one source; every CTA of the row spins on the
+// same tail, thread 0, as vwait), then copies it to dst[y] (n bytes, as k_vget). Ordering is wait_peers' (k_head_merge*):
+// acquire (sys) by thread 0, __syncthreads, then the other threads read the slot, with __ldcv like k_head_merge.
+struct VParts
+{
+    g6::VSlotDev v[7];
+    void* dst[7];
+};
+__global__ void __launch_bounds__(256) k_vwaitget(VParts p, const u64* stepp, size_t payload, size_t n, unsigned code)
+{
+    const u64 step = *stepp;
+    const g6::VSlotDev& v = p.v[blockIdx.y];
+    vwait(v, step, payload, 0, code);
+    const uint4* src = reinterpret_cast<const uint4*>(vrecv(v, step, 0));
+    void* dst = p.dst[blockIdx.y];
+    for (size_t i = blockIdx.x * 256 + threadIdx.x; i < n / 16; i += (size_t)gridDim.x * 256)
+        reinterpret_cast<uint4*>(dst)[i] = __ldcv(src + i);
+    if (blockIdx.x == 0 && threadIdx.x < (n % 16) / 4)
+        reinterpret_cast<unsigned*>(reinterpret_cast<uint4*>(dst) + n / 16)[threadIdx.x] =
+            __ldcv(reinterpret_cast<const unsigned*>(src + n / 16) + threadIdx.x);
+}
+#endif
 // host: index j of sender s in v.src (-1: s does not send v to me)
 inline int vsrc_index(const g6::VSlotDev& v, int s)
 {

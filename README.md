@@ -24,6 +24,8 @@
 >   - trying it on other models
 > - Feedback, issues and PRs all welcome. If you run it, tell us what breaks.
 
+See [CHANGELOG.md](CHANGELOG.md) for what changed since the K1H2 snapshot and [KNOWN-ISSUES.md](KNOWN-ISSUES.md) for open bugs.
+
 # g6: a custom GLM 5.3 (full) engine for six DGX Sparks
 
 g6 is a from-scratch CUDA inference engine for the full GLM 5.3 model (MoE, 256 experts, MLA attention with the sparse

@@ -377,7 +377,7 @@ template <class P> inline PlanPtrs plan_ptrs(const P* p)
 
 // x2 = mlp_norm output fp16 [8][6144], xf_x2 = its fp16 fragment table, out = [8][6144] (BF16 bits if out_bf16).
 inline const char* make_k1(const LayerTensors& T, int M, const Scratch& sc, const __half* x2, const u32* xf_x2,
-                           const PlanPtrs& plan, void* out, int out_bf16, K1& k, Tensor* sh_out, int fuse = 0)
+                           const PlanPtrs& plan, void* out, int out_bf16, K1& k, Tensor* sh_out, int fuse = 0, int split_m = 0)
 {
     k = K1();
     const bool moe = T.t[T_TR3_TAB].p != nullptr;
@@ -400,7 +400,8 @@ inline const char* make_k1(const LayerTensors& T, int M, const Scratch& sc, cons
              f2.shape[2] != 288 || s_nch * 16 > SACTW)
         return "shared / dense MLP records are not [I/16][192][576] + [384][I/32][288] with I <= SACTW";
     if (M < 1 || M > 8) return "M must be 1..8";
-    K1Split s = moe ? k1_split(M) : K1_DENSE_SPLIT;
+    // split_m (S2 design 2.1): the split of a split_m-row step (a session's row class) at any M
+    K1Split s = moe ? k1_split(split_m ? split_m : M) : K1_DENSE_SPLIT;
     if (fuse) { s.KS1 = s.KS1 * s.WG / 2; s.WG = 2; }     // 512-thread CTAs; same k ranges, same partial order (k1.cuh)
     // fuse = 2: where fc1 sums 2 k partials (M = 2, 3) split it in 4 (KS1 = 2). Half the fc1 shared memory per CTA;
     // NOT the bytes of fuse = 0 / 1 there: the fp32 fc1 sums are grouped differently (RESULTS-M1 item 1f).
@@ -543,7 +544,8 @@ inline void warm_proj(const Layer& next, cudaStream_t st, int more = 0)
 
 // fuse = 1: the routed and shared fc1 + fc2 as one persistent launch (K1::fuse, k1_tr3_fused); same bytes out.
 // fuse = 2: the same launch with the 4-partial fc1 split at M = 2, 3 (other bytes there, see make_k1).
-inline const char* make_layer(const LayerTensors& T, int M, const Scratch& sc, const Io& io, Layer& L, int fuse = 0)
+// split_m: as make_k1 (0 = the split of M rows)
+inline const char* make_layer(const LayerTensors& T, int M, const Scratch& sc, const Io& io, Layer& L, int fuse = 0, int split_m = 0)
 {
     L = Layer();
     if (M < 1 || M > 8) return "M must be 1..8";
@@ -586,7 +588,7 @@ inline const char* make_layer(const LayerTensors& T, int M, const Scratch& sc, c
     L.xf_x2.bf16 = L.moe ? sc.xb_x2 : nullptr;
     L.xf_x.M = L.xf_qa.M = L.xf_attn.M = L.xf_x2.M = M;
 
-    if ((e = make_k1(T, M, sc, io.x2, sc.xf_x2, io.plan, io.mlp_part, 1, L.k1, L.sh, fuse))) return e;
+    if ((e = make_k1(T, M, sc, io.x2, sc.xf_x2, io.plan, io.mlp_part, 1, L.k1, L.sh, fuse, split_m))) return e;
     L.w8 = (qmx ? 1 : 0) | (omx ? 2 : 0) | (L.k1.a.s_mx ? 4 : 0);
     return nullptr;
 }

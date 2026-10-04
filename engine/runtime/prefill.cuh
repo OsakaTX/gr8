@@ -79,6 +79,9 @@ inline void pf_env_check()
 {
     std::string e;
     if (env_choice("G6_PF_DRAFT_SHARE", 1, 0, &e) < 0) die(e);
+#if defined(G6_CP_PF_HASH2) && G6_CP_PF_HASH2
+    if (env_choice("G6_CP_PF_HASH2", 1, 1, &e) < 0) die(e);   // HASH2 build: unset / 1 = hash2, 0 = k_cp_pf_hash, else exit
+#endif
 }
 // G6_PF_DRAFT_SHARE=1: the MTP draft prefill borrows the target prefill's tensor-core attention scratch instead of
 // allocating a second root of the same size. Unset / 0 = today's behaviour exactly.
@@ -1676,6 +1679,11 @@ inline void cp_pf_enter(Model& m)
         G6Attn& a = m.layers[i].ab.args;
         m.cp.pf_saved.push_back(a);
         a.mla_cache = m.cp.pf_pool[(m.cp.pf_g0 + i) % 2]; a.block_table = m.cp.pf_ident; a.page_count = a.table_size; a.cp_nr = 0; a.cp_rank = 0;
+#ifdef DEC_S2
+        // S2 below R, a run at base B: staged prefill addresses index keys by logical page (pos / 64, identity table), the
+        // decode views by B + i, so the staged view's index cache starts at page B (132 B per row, s2_relocate)
+        if (m.s2_pf_base && a.index_cache) a.index_cache = (char*)a.index_cache + (size_t)m.s2_pf_base * 64 * 132;
+#endif
     }
     m.cp.pf_staged = true;
 }
@@ -1781,8 +1789,12 @@ __global__ void __launch_bounds__(256) k_cp_pf_hash2(const char* pool, int nr, C
     __syncthreads();
     if (threadIdx.x == 0) { unsigned long long t = 0; for (int i = 0; i < 8; ++i) t += red[i]; atomicAdd(out + (size_t)own.o[blockIdx.y] * ostride, t); }
 }
-// grid 1, block 32: my finished hash (device) -> aux_out (pinned), one store; k_cp_pf_bell's __threadfence_system orders it
-__global__ void k_cp_pf_hfin(const unsigned long long* acc, unsigned long long* out) { if (threadIdx.x == 0) *out = *acc; }
+// grid 1, block 32: my finished hash (device) -> aux_out (pinned), one store, fenced to the system scope by the storing thread
+// itself (k_cp_pf_bell's fence runs in another thread of a later kernel)
+__global__ void k_cp_pf_hfin(const unsigned long long* acc, unsigned long long* out)
+{
+    if (threadIdx.x == 0) { *out = *acc; __threadfence_system(); }
+}
 #endif
 // grid 1, block 32: GPU -> proxy doorbell (after the stream's earlier writes to pinned memory)
 __global__ void __launch_bounds__(32) k_cp_pf_bell(unsigned long long* db, unsigned long long v)
@@ -1821,7 +1833,12 @@ inline void cp_pf_net_init(Model& m, g6::Fabric& fabs, cudaStream_t st)
     n->verify = getenv("G6_CP_PF_VERIFY") && atoi(getenv("G6_CP_PF_VERIFY")) == 1;
     for (cudaEvent_t& e : n->done) G6RT_CK(cudaEventCreateWithFlags(&e, cudaEventDisableTiming));
 #if defined(G6_CP_PF_HASH2) && G6_CP_PF_HASH2
-    n->hash2 = !(getenv("G6_CP_PF_HASH2") && atoi(getenv("G6_CP_PF_HASH2")) == 0);
+    {
+        std::string e;
+        const int v = env_choice("G6_CP_PF_HASH2", 1, 1, &e);   // strict: unset / 1 = hash2, 0 = k_cp_pf_hash, else exit
+        if (v < 0) die(e);
+        n->hash2 = v == 1;
+    }
     n->acc = dmalloc<unsigned long long>(2);
     fprintf(stderr, "# rank %d: G6_CP_PF_HASH2 build: page hash %s\n", m.rank, n->hash2 ? "hash2 (block-reduced, device accumulator)" : "k_cp_pf_hash (env G6_CP_PF_HASH2=0)");
 #endif

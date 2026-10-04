@@ -1,0 +1,129 @@
+// Component 5 bridge to component 6's persistent Batch. No CUDA or allocator.
+// All calls run on the compute thread at safe boundaries. apply() requires an
+// EventGate all-rank fence; callbacks must fail the whole epoch on any error.
+#pragma once
+#include "scheduler.h"
+#include "../s2_batch.h"
+
+namespace g6s2 {
+struct Payload { std::vector<int> prompt; int chunk = 4; };
+struct Emission { uint32_t count = 0; bool finished = false; };
+struct DriverHooks {
+    // Real TP4 pool/binding adapter: canonical base, never a per-rank first-fit.
+    std::function<void(const Grant&)> bind;
+    std::function<void(const Slot&)> retire;
+    // Full prefill quantum: both lanes, main AND draft consumption, synchronized.
+    std::function<void(const Slot&, const Payload&, uint32_t, uint32_t)> prefill;
+    std::function<std::vector<int>(const s2::Step&)> run;
+    // Exact native Emitter policy (stop/min/max) on EVERY rank, not just rank0.
+    std::function<Emission(Key, const int*, int)> emit;
+    std::function<void(Key, long, int, int, int)> round;
+    // One completion notification; physical KV release waits for the event fence.
+    std::function<void(Key, const s2::Stats&)> terminal;
+};
+class Driver {
+    Scheduler scheduler_;
+    DriverHooks hooks_;
+    std::array<Payload, MAX_SESSIONS> payload_;
+    std::array<uint32_t, MAX_SESSIONS> emitted_{};
+    std::array<bool, MAX_SESSIONS> initialized_{};
+    s2::Batch batch_;
+    s2::Hooks batch_hooks() {
+        return {
+            [this](const s2::Step& s) {
+                auto ids = hooks_.run(s);
+                require(ids.size() == s.r.size(), "engine returned wrong row count");
+                return ids;
+            },
+            [this](int q, long round, int base, int accepted, int K) {
+                if (hooks_.round) hooks_.round(scheduler_.slots()[q].key, round, base, accepted, K);
+            },
+            [this](int q, const int* ids, int n) {
+                const auto& s = scheduler_.slots()[q];
+                auto e = hooks_.emit(s.key, ids, n);
+                require(e.count <= unsigned(n) && e.count <= s.req.max_tokens - emitted_[q], "bad emitter count");
+                require(e.finished || e.count == unsigned(n), "partial emission without stop");
+                emitted_[q] += e.count;
+                return e.finished || emitted_[q] == s.req.max_tokens;
+            }
+        };
+    }
+    Completion completion(Key k) const {
+        const auto& s = scheduler_.slots()[k.slot];
+        return {k, emitted_[k.slot] - s.emitted, batch_.finished(int(k.slot))};
+    }
+public:
+    Driver(Config c, DriverHooks h) : scheduler_(c), hooks_(std::move(h)),
+        batch_(int(c.mtp), int(c.max_rows), batch_hooks()) {
+        require(bool(hooks_.bind) && bool(hooks_.retire) && bool(hooks_.prefill) && bool(hooks_.run) && bool(hooks_.emit), "missing driver callback");
+    }
+    const Scheduler& state() const { return scheduler_; }
+    const s2::Stats& stats(Key k) const {
+        require(k.slot < MAX_SESSIONS && scheduler_.slots()[k.slot].key == k && initialized_[k.slot], "stats for stale/uninitialized slot");
+        return batch_.stats(int(k.slot));
+    }
+    const s2::Stats* stats_if_initialized(Key k) const {
+        require(k.slot < MAX_SESSIONS && scheduler_.slots()[k.slot].key == k, "stats for stale slot");
+        return initialized_[k.slot] ? &batch_.stats(int(k.slot)) : nullptr;
+    }
+    void fail() { scheduler_.fail(); }
+    void idle_boundary(uint64_t b) { scheduler_.idle_boundary(b); }
+    Changes apply(const Commit& c, const Payload* p = nullptr) {
+        if (c.admit) {
+            require(p && p->prompt.size() == c.admit->req.prompt_tokens && p->chunk > 0, "admit payload mismatch");
+            require(c.admit->req.max_tokens <= INT32_MAX && p->prompt.size() <= INT32_MAX, "Batch integer range");
+        } else require(!p, "payload without grant");
+        auto before = scheduler_.slots();
+        auto changes = scheduler_.apply(c); // validates the entire transaction first
+        try {
+            for (const auto& old : before) {
+                const auto& now = scheduler_.slots()[old.key.slot];
+                if (old.phase == Phase::Free || (now.phase != Phase::Free && old.key == now.key)) continue;
+                if (initialized_[old.key.slot]) batch_.release(int(old.key.slot));
+                initialized_[old.key.slot] = false;
+                hooks_.retire(old); // individual run only; NEVER reset the whole cache
+                payload_[old.key.slot] = Payload{}; emitted_[old.key.slot] = 0;
+            }
+            if (c.admit) {
+                payload_[c.admit->key.slot] = *p;
+                hooks_.bind(*c.admit);
+            }
+        } catch (...) { scheduler_.fail(); throw; }
+        return changes;
+    }
+    Quantum step() {
+        auto q = scheduler_.next();
+        try {
+            if (q.kind == Kind::Prefill) {
+                auto k = q.keys[0];
+                hooks_.prefill(scheduler_.slots()[k.slot], payload_[k.slot], q.first, q.rows);
+                scheduler_.complete_prefill();
+            } else if (q.kind == Kind::PromptTail) {
+                auto k = q.keys[0]; const auto& s = scheduler_.slots()[k.slot];
+                const auto& p = payload_[k.slot];
+                require(!initialized_[k.slot], "duplicate prompt tail");
+                batch_.admit({int(k.slot)}, {{p.prompt, int(q.first), p.chunk, int(s.req.max_tokens)}});
+                initialized_[k.slot] = true;
+                scheduler_.complete_tail(completion(k));
+            } else if (q.kind == Kind::Decode) {
+                std::vector<int> order;
+                for (unsigned i = 0; i < q.count; ++i) {
+                    require(initialized_[q.keys[i].slot] && batch_.active(int(q.keys[i].slot)), "scheduler/Batch active mismatch");
+                    order.push_back(int(q.keys[i].slot));
+                }
+                require(batch_.round(order), "empty scheduled decode round");
+                std::vector<Completion> results;
+                for (unsigned i = 0; i < q.count; ++i) results.push_back(completion(q.keys[i]));
+                scheduler_.complete_decode(results);
+            }
+            if (q.kind == Kind::PromptTail || q.kind == Kind::Decode)
+                for (unsigned i = 0; i < q.count; ++i) {
+                    auto k = q.keys[i];
+                    if (scheduler_.slots()[k.slot].phase == Phase::Retiring && hooks_.terminal)
+                        hooks_.terminal(k, batch_.stats(int(k.slot)));
+                }
+        } catch (...) { scheduler_.fail(); throw; }
+        return q;
+    }
+};
+} // namespace g6s2

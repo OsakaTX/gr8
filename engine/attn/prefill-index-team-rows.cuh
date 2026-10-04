@@ -59,7 +59,7 @@ extern "C" int g6_attn_bind_prefill_index_rows(G6AttnPrefill* p,G6AttnBinding* b
         gp::index_scores_grouped<<<dim3((a.context+63)/64,(n+3)/4),256,0,st>>>(a,start,n,w.iq,w.weights,p->ikey,p->kscale,w.si,w.ii);
 #endif
         if(out_scores){auto e=cudaMemcpyAsync(out_scores+(int64_t)start*a.context,w.si,(size_t)n*a.context*4,cudaMemcpyDeviceToDevice,st);if(e!=cudaSuccess)return int(e);}
-        auto e=ga::select_index(a,w,start,n,st);if(e!=cudaSuccess)return int(e);
+        auto e=gp::select_prefill(a,w,start,n,st);if(e!=cudaSuccess)return int(e);
     }
     return int(cudaGetLastError());
 }

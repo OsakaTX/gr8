@@ -2,3 +2,4 @@ __pycache__/
 *.pyc
 /bin/
 /config/cluster.env
+bench/results.jsonl

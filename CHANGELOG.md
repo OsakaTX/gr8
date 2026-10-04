@@ -1,5 +1,9 @@
 # Changelog
 
+## 2026-10-04: gate harness (`bench/gate/`)
+
+- New: `bench/gate/gate.py` measures a build (KL drift, needle, long prompt, pbench, workloads, drafter counters), appends one JSON line per run, builds a baseline per topology and checks a build against it. See `bench/gate/README.md`. No engine change.
+
 ## 2026-10-04: S2 multi-session snapshot (since b85a7a6, the K1H2 snapshot)
 
 The default build (`scripts/build.sh`) is still K1H2. The new multi-session code is compiled in only with

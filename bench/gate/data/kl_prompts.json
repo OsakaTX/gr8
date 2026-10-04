@@ -1,0 +1,18 @@
+[
+ "Write a Python function that merges two sorted linked lists and returns the head of the merged list.",
+ "Explain how a B-tree keeps its height small when records are inserted in random order.",
+ "Write a C function that reverses a null-terminated string in place without using the standard library.",
+ "Describe the water cycle to a ten-year-old, using one short paragraph and one concrete example.",
+ "Return a JSON object describing a library book with fields title, authors (list), year, isbn and subjects (list).",
+ "Write a bash script that finds the ten largest files under a directory and prints their sizes in human units.",
+ "Summarize the main causes of the French Revolution in a numbered list of five points.",
+ "Write a SQL query that returns, per customer, the date of the second most recent order.",
+ "Translate this sentence into French and German, then explain one grammar difference: 'The children were playing in the garden when it began to rain.'",
+ "Write a short story, about 200 words, in which a lighthouse keeper receives an unexpected visitor.",
+ "Write a Rust function that parses a comma-separated line into a Vec<i64>, returning an error for any bad field.",
+ "Explain the difference between latency and throughput using a grocery store checkout as the example.",
+ "Produce a YAML file for a Kubernetes Deployment of three nginx replicas with CPU and memory limits.",
+ "Prove that the square root of 2 is irrational, step by step.",
+ "Write a TypeScript class implementing an LRU cache with get and put in O(1).",
+ "Give a week-long beginner running plan as a markdown table with a column for each day and a short note."
+]

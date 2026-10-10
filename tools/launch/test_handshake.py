@@ -137,11 +137,16 @@ class HandshakeTests(unittest.TestCase):
         finally:
             f.close()
 
-    def test_unsafe_home_is_refused(self):
-        v = self.assert_refused([hello(1), hello(2, home='/g6; touch /tmp/x'), hello(3)], 'G6_HOME')
-        self.assertEqual(v['values']['rank 2 (127.0.0.1)'], "'/g6; touch /tmp/x'")
-        self.assert_refused([hello(1, home='relative/g6'), hello(2), hello(3)], 'G6_HOME')
+    def test_unusable_home_is_refused(self):
+        v = self.assert_refused([hello(1), hello(2, home='relative/g6'), hello(3)], 'G6_HOME')
+        self.assertEqual(v['values']['rank 2 (127.0.0.1)'], "'relative/g6'")
+        self.assert_refused([hello(1, home='/g6\ntouch x'), hello(2), hello(3)], 'G6_HOME')
         self.assert_refused([hello(1, home=None), hello(2), hello(3)], 'G6_HOME')
+
+    def test_any_absolute_home_is_accepted(self):
+        # the shim shell-quotes the path, so a space, a quote or a non-ASCII letter is fine
+        v, out = self.run_case([hello(1, home="/home/jos\u00e9/my g6"), hello(2, home="/g6/it's"), hello(3)], ok=OK)
+        self.assertEqual(v, OK)
 
     def test_crossed_rails(self):
         self.assert_refused([hello(1, rails=['10.2.0.2', '10.1.0.2']), hello(2), hello(3)], 'rails')

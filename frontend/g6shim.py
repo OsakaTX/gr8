@@ -43,10 +43,10 @@ SSH = ['ssh', '-o', 'BatchMode=yes', '-o', 'ControlPath=/tmp/g6shim-ssh-%C', '-o
 VOCAB = 154880
 ENGINE_MAX_LP = 20  # the engine's top lists hold 20 (serve.h LP_MAX = glue::LP_K); it clamps silently above
 FLOOR = -9999.0  # logprob sent for -inf / nan (the front end clamps at the same value)
-# A rank dir on another box ("host:/path") ends up in ssh's argv and in a remote shell command: the host must be a plain
-# name or address (ssh reads a leading '-' as an option) and the path a plain absolute path. The remote commands also
-# shell-quote it, which leaves such a path unchanged.
-REMOTE_DIR = re.compile(r'[A-Za-z0-9_][A-Za-z0-9._@-]*:/[A-Za-z0-9._/+-]*')
+# A rank dir on another box ("host:/path") ends up in ssh's argv and in a remote shell command. The remote commands
+# shell-quote the path (a plain path comes out unchanged). The host must be a name or address: ssh reads a leading '-'
+# as an option. Neither part may hold control characters.
+REMOTE_DIR = re.compile(r'[A-Za-z0-9_][A-Za-z0-9._@-]*:/[^\x00-\x1f\x7f]*')
 
 
 def check_rank_dirs(dirs):
@@ -56,8 +56,8 @@ def check_rank_dirs(dirs):
         return 'the first --rank-dirs entry (rank 0) must be a local path'
     bad = [d for d in dirs[1:] if ':' in d and not REMOTE_DIR.fullmatch(d)]
     if bad:
-        return ('a remote --rank-dirs entry must be host:/absolute/path (letters, digits and ._/+-, the host not '
-                f'starting with -): {" ".join(bad)}')
+        return ('a remote --rank-dirs entry must be host:/absolute/path, the host a name or address (not starting with '
+                f'-), no control characters: {" ".join(map(repr, bad))}')
     return None
 
 

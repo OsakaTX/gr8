@@ -63,7 +63,8 @@ MTP k=2 at temperature 0.7, one test window on one cluster.
       sysctl -w vm.compaction_proactiveness=0
 
 - To build: CUDA 13 (`nvcc` with `sm_121a`), g++ with C++20, rdma-core / libibverbs-dev, cargo, and Python 3. The
-  stock DGX OS (Ubuntu 24.04) has all of them except cargo.
+  stock DGX OS (Ubuntu 24.04) has all of them except cargo. Or, in place of all of these, Docker with the NVIDIA
+  container toolkit (DGX OS has both): see [In Docker](#in-docker).
 
 ## Quick start
 
@@ -90,6 +91,22 @@ on each.
 The first `up` downloads this box's part: about 35 minutes at 40 MB/s. To download ahead of time, run `./gr8 glm53
 prepare` with the same options. The drafter's licence (CC BY-NC-ND 4.0) forbids sharing a converted copy, so each box
 downloads the drafter and converts its own rank.
+
+### In Docker
+
+Nothing to build on the boxes: build the image on one (about 10 minutes on a GB10), copy it to the others, and run the
+same `up` through `docker/gr8` on every box. It takes the same options and config file as `./gr8 glm53`:
+
+    git clone https://github.com/kindlingai/gr8 && cd gr8      # on every box
+    docker build -t gr8 .                                     # on one box, then copy the image to the others:
+    for h in 10.0.0.2 10.0.0.3 10.0.0.4; do docker save gr8 | ssh $h docker load; done
+    # on every box:
+    docker/gr8 up --tp 4 --peers 10.0.0.1,10.0.0.2,10.0.0.3,10.0.0.4 \
+        --model https://huggingface.co/kindlingai/glm-5.3-exlr8-k2-k3-k4 --model-cache /opt/g6/cache \
+        --drafter https://huggingface.co/incoai/GLM-5.3-DFlash2
+
+Then `docker/gr8 status`, `docker/gr8 smoke` and `docker/gr8 down`, as above. [docker/README.md](docker/README.md) has
+its settings (which account runs the container, the ssh keys, the working directory) and what the container gets.
 
 ## Running it
 

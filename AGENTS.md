@@ -46,6 +46,7 @@ visible. A PR builds every topology (CI's engine build does).
 | m4sim from the release against a PyTorch forward of the same weights | one GB10, transformers with `glm_moe_dsa` | `engine/ref/release_forward.py` |
 | the launch: options, model sets, handshake, mentat | anywhere, stdlib only | `python3 -m unittest discover -s tools/launch` |
 | the launch end to end (four supervisors, stub engines) | Linux (it needs 127.0.0.2-4) | the line above runs it, and skips it elsewhere |
+| `docker/gr8`'s mounts (the host paths it hands the container) | anywhere, stdlib only | `python3 -m unittest discover -s docker` |
 
 A kernel or anything else that changes numerics gets an exactness or tolerance test against the path it replaces, and
 the PR says which and why a tolerance is safe.

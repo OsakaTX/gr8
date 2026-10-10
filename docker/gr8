@@ -134,9 +134,15 @@ up() {
 }
 
 once() {
-  local tty=()
+  local tty=() extra=()
   [ -t 0 ] && [ -t 1 ] && tty=(-it)
-  docker run --rm "${tty[@]}" "${run[@]}" --entrypoint bash "$IMAGE" -c "$prep
+  if [ "$cmd" = bench ]; then
+    # bench/pbench.py appends to results.jsonl next to itself, in the read-only image: keep it in G6_HOME/out instead
+    docker run --rm "${run[@]}" --entrypoint bash "$IMAGE" -c \
+      'mkdir -p "$G6H/out" && touch "$G6H/out/pbench-results.jsonl"'
+    extra=(--mount "type=bind,src=$home/out/pbench-results.jsonl,dst=/opt/gr8/bench/results.jsonl")
+  fi
+  docker run --rm "${tty[@]}" "${run[@]}" "${extra[@]}" --entrypoint bash "$IMAGE" -c "$prep
     exec /opt/gr8/gr8 glm53 \"\$@\"" bash "$@"
 }
 

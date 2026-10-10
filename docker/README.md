@@ -26,7 +26,7 @@ command on every box, from any directory that holds your `cluster.env` (or pass 
 Then, from any box: `docker/gr8 status`, `docker/gr8 smoke`, `docker/gr8 logs supervisor`, and `docker/gr8 down` to stop
 every box. `up` follows the boot until the cluster serves, as `./gr8 glm53 up` does; Ctrl-C leaves the boot running.
 `check`, `show-config` and `prepare` work as on bare metal. `build`, `stage` and `packs` do not apply: the image is the
-build.
+build. `docker/gr8 bench` appends its results to `G6_HOME/out/pbench-results.jsonl` (bare metal: `bench/results.jsonl`).
 
 Before the first `up`:
 
@@ -47,6 +47,10 @@ Before the first `up`:
 | `G6_HOME` | `~GR8_USER/gr8-docker` | this box's working directory (`out/`, `s2/`, `run/`); `bin/` there becomes a link to the image's engine for the TP, so it must not be a bare-metal build's `bin/` |
 
 The shim runs on the image's `python3` (`PY=/usr/bin/python3` unless you set `PY`).
+
+With `GR8_USER` set to another account, that account must be able to read the directory you run `docker/gr8` from (it
+is the container's working directory), and its `G6_HOME` and model cache must already exist, writable by it:
+`docker/gr8` creates them only for itself.
 
 ### Networks
 

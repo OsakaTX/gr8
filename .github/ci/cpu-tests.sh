@@ -38,6 +38,8 @@ python3 tools/s2_costfit.py --selftest
 (cd frontend && python3 -m unittest tests.test_s2shim tests.test_parser)
 # the launch: options, model sets, the handshake, mentat, and four supervisors end to end on 127.0.0.1-4
 python3 -m unittest discover -s tools/launch
+# docker/gr8's mounts: the host paths it hands the container, from the launcher's option parsing
+python3 -m unittest discover -s docker
 
 step "Rust: engine/loader-rs"
 cargo test --locked --manifest-path engine/loader-rs/Cargo.toml

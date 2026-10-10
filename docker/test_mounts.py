@@ -80,6 +80,13 @@ class MountsTests(unittest.TestCase):
     def test_a_bad_option_exits_2(self):
         self.assertEqual(run(['--no-such-option', 'x'], self.t), 2)
 
+    def test_executables_must_be_in_the_image_or_under_g6_home(self):
+        base = [*PEERS, '--g6-home', '/work/g6']
+        self.assertEqual(run([*base, '--py', '/home/someone/venv/bin/python'], self.t), 2)     # a host venv
+        self.assertEqual(run([*base, '--front-bin', '/home/someone/gr8/bin/g6front-rs'], self.t), 2)
+        self.assertIsInstance(run([*base, '--py', sys.executable], self.t), dict)               # in the image
+        self.assertIsInstance(run([*base, '--front-bin', '/work/g6/bin/g6front-rs'], self.t), dict)   # G6_HOME
+
 
 if __name__ == '__main__':
     unittest.main()

@@ -32,6 +32,18 @@ def mounts(o):
     return out
 
 
+def executables(o):
+    """None, or why PY / FRONT_BIN cannot work: they run inside the image, so a host path (a bare-metal venv or build)
+    must be in the image or under G6_HOME, which is mounted. This runs in the image, so os.path.exists sees its files."""
+    home = os.path.abspath(o.get('G6_HOME'))
+    for k in ('PY', 'FRONT_BIN'):
+        v = o.get(k)
+        if v and not os.path.exists(v) and not os.path.abspath(v).startswith(home + os.sep):
+            return (f'{k}={v} is not in the image: docker/gr8 runs the image\'s python3 and g6front-rs. Leave {k} '
+                    f'out of the options, or name a path in the image')
+    return None
+
+
 def tp(o):
     if o.get('TP'):
         return o.int('TP')
@@ -45,6 +57,10 @@ def main(argv):
         n = tp(o)
     except opt.OptionError as e:
         print(f'gr8: {e}', file=sys.stderr)
+        return 2
+    bad = executables(o)
+    if bad:
+        print(f'gr8: {bad}', file=sys.stderr)
         return 2
     print(f'home {os.path.abspath(o.get("G6_HOME"))}')
     print(f'tp {n}')

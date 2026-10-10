@@ -27,8 +27,9 @@
 set -eu
 IMAGE=${GR8_IMAGE:-gr8}
 NAME=gr8
-user=${GR8_USER:-$(id -un)}
-uhome=$(getent passwd "$user" | cut -d: -f6) || true
+me=$(id -un)
+user=${GR8_USER:-$me}
+if [ "$user" = "$me" ]; then uhome=$HOME; else uhome=$(getent passwd "$user" | cut -d: -f6) || true; fi
 [ -n "$uhome" ] || { echo "docker/gr8: no account $user" >&2; exit 2; }
 export G6_HOME=${G6_HOME:-$uhome/gr8-docker}
 
@@ -49,15 +50,19 @@ uid=$(id -u "$user"); gid=$(id -g "$user")
 base=(--init --network host --pid host --user "$uid:$gid" -e HOME="$uhome"
       -v /etc/passwd:/etc/passwd:ro -v /etc/group:/etc/group:ro -w "$PWD")
 
-# the launcher's options that are set in this shell, and every G6_* variable, reach the container as they would reach
+# the launcher's options that are set in this shell, and the variables below, reach the container as they would reach
 # a bare-metal launcher
 envs=()
-for k in $(docker run --rm --entrypoint python3 "$IMAGE" -c \
-    'import sys; sys.path.insert(0, "/opt/gr8/tools/launch"); import options; print(" ".join(options.KEYS))'); do
+keys=$(docker run --rm --entrypoint python3 "$IMAGE" -c \
+    'import sys; sys.path.insert(0, "/opt/gr8/tools/launch"); import options; print(" ".join(options.KEYS))') ||
+  die "could not read the launcher's option names from $IMAGE"
+for k in $keys; do
   [ -n "${!k+x}" ] && envs+=(-e "$k")
 done
 for k in $(compgen -e); do
-  case $k in G6_*) envs+=(-e "$k") ;; esac
+  # G6_* (engine and loader), GR8_* (the fetcher's GR8_HF_ENDPOINT, GR8_FETCH_WORKERS, ...) and HF_TOKEN; -e NAME passes
+  # the value without putting it on a command line
+  case $k in G6_*|GR8_*|HF_TOKEN) envs+=(-e "$k") ;; esac
 done
 # the shim runs on the image's python3 (stdlib only), not a venv in G6_HOME; an explicit PY still wins
 [ -n "${PY+x}" ] || envs+=(-e PY=/usr/bin/python3)
@@ -69,26 +74,37 @@ case $cmd in smoke|bench) popts=() ;; esac
 # Nothing below reads GR8_USER's files from the host (you may not be able to): the checks run in the container, as
 # GR8_USER, and --mount refuses a missing path where -v would create it, owned by root.
 home='' tp=''
-me=$(id -un)
 declare -A mode=([$PWD]=ro)
 order=("$PWD")
 add() {   # one mount per path; read-write wins
   [ -n "${mode[$2]+x}" ] || order+=("$2")
   [ "${mode[$2]:-}" = rw ] || mode[$2]=$1
 }
+# all of the helper's output or none of it: a helper that fails part way starts nothing
+paths=$(docker run --rm "${base[@]}" --mount "type=bind,src=$PWD,dst=$PWD,readonly" "${envs[@]}" --entrypoint python3 \
+          "$IMAGE" /opt/gr8/docker/mounts.py ${popts[@]+"${popts[@]}"}) || die "the options do not work here (above)"
 while read -r kind path; do
   case $kind in
     home) home=$path ;;
     tp) tp=$path ;;
-    rw) [ "$user" != "$me" ] || mkdir -p "$path"; add rw "$path" ;;
-    # a missing input: the launcher's check names it (when you can see GR8_USER's paths)
-    ro) [ "$user" != "$me" ] && [ ! -e "$path" ] || add ro "$path" ;;
+    # G6_HOME and the model cache: up and prepare create them, as the launcher does on bare metal. Another account's
+    # paths may not be visible to you: they are mounted as given, and docker refuses a missing one.
+    rw) if [ -d "$path" ] || [ "$user" != "$me" ]; then add rw "$path"
+        elif [ "$cmd" = up ] || [ "$cmd" = restart ] || [ "$cmd" = prepare ]; then mkdir -p "$path"; add rw "$path"
+        elif [ "$path" = "$home" ]; then die "no $home: nothing has run on this box (docker/gr8 up creates it)"
+        fi ;;   # a missing model cache, for a command that does not fill it: the launcher's check names it
+    # your own missing input is left out, so the launcher's check names it; another account's is mounted as given
+    ro) [ "$user" = "$me" ] && [ ! -e "$path" ] || add ro "$path" ;;
   esac
-done < <(docker run --rm "${base[@]}" --mount "type=bind,src=$PWD,dst=$PWD,readonly" "${envs[@]}" --entrypoint python3 "$IMAGE" \
-           /opt/gr8/docker/mounts.py ${popts[@]+"${popts[@]}"} || echo "fail")
-[ -n "$home" ] && [ -n "$tp" ] || die "could not read the options (the error is above)"
+done <<< "$paths"
+[ -n "$home" ] && [ -n "$tp" ] || die "the options helper printed no G6_HOME or TP"
 case $tp in 4) bin=bin ;; 6) bin=bin6 ;; 3) bin=bin3 ;; *) die "TP=$tp: want 4, 6 or 3" ;; esac
-mounts=(--mount "type=bind,src=${GR8_SSH:-$uhome/.ssh},dst=$uhome/.ssh,readonly")
+# the head's shim reaches the other boxes with these keys; a box without ~/.ssh can still run a rank and the read-only
+# commands. A named GR8_SSH must exist (docker says so), and so must another account's ~/.ssh if you cannot see it.
+mounts=()
+if [ -n "${GR8_SSH:-}" ] || [ "$user" != "$me" ] || [ -d "$uhome/.ssh" ]; then
+  mounts+=(--mount "type=bind,src=${GR8_SSH:-$uhome/.ssh},dst=$uhome/.ssh,readonly")
+fi
 for p in "${order[@]}"; do
   if [ "${mode[$p]}" = rw ]; then mounts+=(--mount "type=bind,src=$p,dst=$p")
   else mounts+=(--mount "type=bind,src=$p,dst=$p,readonly"); fi
@@ -104,12 +120,27 @@ prep="if [ -e \"\$G6H/bin\" ] && [ ! -L \"\$G6H/bin\" ]; then
 
 running() { [ -n "$(docker ps -q --filter "name=^$NAME\$")" ]; }
 
+# Whether this container's supervisor is serving: gr8.state names the supervisor's pid, as bare-metal up checks it.
+# The container's shell writes its own pid to out/docker-up.pid and then becomes the supervisor (exec all the way down).
+# The pid must also be alive: a killed boot leaves both files behind, naming the same dead pid (--pid host: host pids).
+serving_check='import json, os
+o = os.environ["G6H"] + "/out/"
+with open(o + "gr8.state") as f:
+    st = json.load(f)
+with open(o + "docker-up.pid") as f:
+    mine = int(f.read())
+try:
+    os.kill(mine, 0)
+except ProcessLookupError:
+    mine = None
+print("serving" if mine and st.get("state") == "serving" and st.get("pid") == mine else "not yet")'
+
 up() {
   running && die "container $NAME already runs on this box: docker/gr8 down first"
-  local t0 follow s
-  t0=$(date +%s)
+  local follow s
   # the supervisor's output goes to out/supervisor.log, as a bare-metal up writes it, and to docker logs
   docker run -d --rm --name "$NAME" --oom-score-adj 1000 "${run[@]}" --entrypoint bash "$IMAGE" -c "$prep
+    echo \$\$ > \"\$G6H/out/docker-up.pid\"
     exec > >(tee -a \"\$G6H/out/supervisor.log\") 2>&1
     exec /opt/gr8/gr8 glm53 up --foreground \"\$@\"" bash "$@" > /dev/null
   echo "container $NAME, log $home/out/supervisor.log"
@@ -123,10 +154,8 @@ up() {
       echo "docker/gr8: the container stopped (the reason is above, and in $home/out)" >&2
       return 1
     fi
-    # this boot's state only: an older gr8.state may still say serving
-    s=$(docker exec "$NAME" sh -c 'f=$G6H/out/gr8.state; [ -f "$f" ] && echo "$(stat -c %Y "$f") $(cat "$f")"' \
-        2>/dev/null) || true
-    if [ -n "$s" ] && [ "${s%% *}" -ge "$t0" ] && [[ $s == *'"state": "serving"'* ]]; then
+    s=$(docker exec "$NAME" python3 -c "$serving_check" 2>/dev/null) || true
+    if [ "$s" = serving ]; then
       sleep 1; kill "$follow" 2>/dev/null || true
       return 0
     fi
@@ -148,6 +177,10 @@ once() {
 
 case $cmd in
   up) up "$@" ;;
-  restart) once down "$@" || true; up "$@" ;;
+  # down asks every box's supervisor to stop and stops this one; its container leaves a moment after the supervisor
+  restart) once down "$@" || die "down failed (above): not starting"
+           for _ in $(seq 60); do running || break; sleep 1; done
+           running && die "container $NAME has not stopped after down: docker/gr8 up once docker ps no longer lists it"
+           up "$@" ;;
   *) once "$cmd" "$@" ;;
 esac

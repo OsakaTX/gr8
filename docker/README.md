@@ -29,6 +29,10 @@ Stop the cluster with `docker/gr8 down`, not `docker stop` or `docker kill` on o
 with its engine, so nothing tells the others, which keep their engines (requests fail with HTTP 500) until a
 `docker/gr8 down` from any box. An engine that dies on its own (the OOM killer, a crash) stops every box, as on bare
 metal. `restart` runs `down`, waits for this box's container to leave, then `up`.
+
+The same goes for a watchdog of your own (a memory floor, a health check): have it end the engine, not the container,
+for example `sudo kill -KILL $(pgrep -x g6m4)`. The box's supervisor then reports `engine exited (-9)` to the head and
+the head stops every box; killing the container would leave the other boxes up and unable to serve.
 `check`, `show-config` and `prepare` work as on bare metal. `build`, `stage` and `packs` do not apply: the image is the
 build. `docker/gr8 bench` appends its results to `G6_HOME/out/pbench-results.jsonl` (bare metal: `bench/results.jsonl`).
 

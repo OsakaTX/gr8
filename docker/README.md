@@ -38,9 +38,10 @@ build. `docker/gr8 bench` appends its results to `G6_HOME/out/pbench-results.jso
 
 Before the first `up`:
 
-- passwordless ssh from the head to every other box, by the address in `--peers`: the head's shim writes each request
-  into the other ranks' `s2/` directories over ssh. Check it from the head, with no prompt:
-  `for p in 10.0.0.2 10.0.0.3 10.0.0.4; do ssh -o BatchMode=yes $p true && echo "$p ok"; done`
+- at TP=6 only, passwordless ssh from the head to every other box, by the address in `--peers`: the TP=6 head's shim
+  writes each request into the other ranks' `s2/` directories over ssh (TP=4 and TP=3 need none: the head engine passes
+  requests over its control links). Check it from the head, with no prompt:
+  `for p in 10.0.0.2 10.0.0.3 10.0.0.4 10.0.0.5 10.0.0.6; do ssh -o BatchMode=yes $p true && echo "$p ok"; done`
 - the NVIDIA container toolkit (on DGX OS by default) and access to docker for whoever runs `docker/gr8`.
 
 ### Settings
@@ -51,7 +52,7 @@ Before the first `up`:
 |---|---|---|
 | `GR8_IMAGE` | `gr8` | the image |
 | `GR8_USER` | you | the account the container runs as. Starting a container takes docker access, which is root-equivalent; the engine needs none of it, so an account with no sudo and no docker can run it while you start it |
-| `GR8_SSH` | `~GR8_USER/.ssh` | the ssh directory the head's shim uses, mounted read-only as that account's `~/.ssh` |
+| `GR8_SSH` | `~GR8_USER/.ssh` | TP=6: the ssh directory the head's shim uses, mounted read-only as that account's `~/.ssh`. At TP=4 and TP=3 no ssh directory is mounted |
 | `G6_HOME` | `~GR8_USER/gr8-docker` | this box's working directory (`out/`, `s2/`, `run/`); `bin/` there becomes a link to the image's engine for the TP, so it must not be a bare-metal build's `bin/` |
 
 The shim runs on the image's `python3` (`PY=/usr/bin/python3` unless you set `PY`).
@@ -76,8 +77,8 @@ so the launcher finds this box's place in `--peers` and its two fabric rails exa
 | `--pid host` | the launcher refuses to start when another `g6m4` runs on the box; it can see one started outside the container only with the host's process list |
 | `--user` (GR8_USER), `--cap-drop ALL` (but `IPC_LOCK`), `--security-opt no-new-privileges`, `--read-only` with a private `/tmp` | the engine runs with no more rights than it needs |
 | `--oom-score-adj 1000` (`up`) | under memory pressure the kernel ends the engine first, before sshd or the rest of the box |
-| `G6_HOME` and the model cache read-write; the release, the drafter and the config file read-only, each at the same path as on the host | the head's shim names each worker's `s2/` by the path that worker reported, and writes it over ssh on the worker's host |
-| `GR8_SSH` read-only, `/etc/passwd` and `/etc/group` read-only | the shim's ssh |
+| `G6_HOME` and the model cache read-write; the release, the drafter and the config file read-only, each at the same path as on the host | the launcher hands these paths to the engine and the shim as they are (at TP=6 the head's shim also writes each worker's `s2/` over ssh, by the path that worker reported) |
+| `/etc/passwd` and `/etc/group` read-only; at TP=6, `GR8_SSH` read-only | GR8_USER's name and home; the TP=6 shim's ssh |
 
 A missing path makes `docker run` stop with "bind source path does not exist" (`docker/gr8` mounts with `--mount`, which
 refuses a missing path where `-v` would create one owned by root).

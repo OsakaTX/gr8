@@ -157,17 +157,26 @@ class WrapperTests(unittest.TestCase):
         self.assertTrue(os.path.isdir(self.cache))
         self.assertTrue([c for c in self.calls() if c[0] == 'run' and '-d' in c])
 
-    def test_ssh_is_mounted_only_when_there_is_one_or_it_is_named(self):
+    def ssh_mounts(self, *argv, **env):
+        log = os.path.join(self.fake, 'log')
+        if os.path.exists(log):
+            os.remove(log)
+        self.gr8('status', *argv, **env)
+        return [x for x in self.started()[0] if '.ssh' in x or 'src=/no/such/dir' in x]
+
+    def test_tp4_and_tp3_mount_no_ssh_keys(self):
         os.makedirs(self.g6)
-        self.gr8('status')
-        self.assertFalse([x for x in self.started()[0] if '.ssh' in x])
         os.makedirs(os.path.join(self.home, '.ssh'))
-        os.remove(os.path.join(self.fake, 'log'))
-        self.gr8('status')
-        self.assertTrue([x for x in self.started()[0] if f'src={self.home}/.ssh' in x])
-        os.remove(os.path.join(self.fake, 'log'))
-        self.gr8('status', GR8_SSH='/no/such/dir')               # named: mounted as given, docker refuses it
-        self.assertTrue([x for x in self.started()[0] if 'src=/no/such/dir' in x])
+        self.assertEqual(self.ssh_mounts(), [])                          # TP=4 passes requests without ssh
+        self.assertEqual(self.ssh_mounts(GR8_SSH='/no/such/dir'), [])
+
+    def test_tp6_mounts_ssh_when_there_is_one_or_it_is_named(self):
+        os.makedirs(self.g6)
+        self.helper(f'home {self.g6}\ntp 6\nrw {self.g6}\nrw {self.cache}\n')
+        self.assertEqual(self.ssh_mounts(), [])                          # no ~/.ssh: a rank can still run
+        os.makedirs(os.path.join(self.home, '.ssh'))
+        self.assertTrue([x for x in self.ssh_mounts() if f'src={self.home}/.ssh' in x])
+        self.assertTrue(self.ssh_mounts(GR8_SSH='/no/such/dir'))        # named: mounted as given, docker refuses it
 
     def boot(self, state_pid, my_pid, looks):
         os.makedirs(os.path.join(self.g6, 'out'))

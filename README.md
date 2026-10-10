@@ -110,7 +110,7 @@ same `up` through `docker/gr8` on every box. It takes the same options and confi
         --drafter https://huggingface.co/incoai/GLM-5.3-DFlash2
 
 Then `docker/gr8 status`, `docker/gr8 smoke` and `docker/gr8 down`, as above. [docker/README.md](docker/README.md) has
-its settings (which account runs the container, the ssh keys, the working directory) and what the container gets.
+its settings (which account runs the container, the working directory, the ssh keys at TP=6) and what the container gets.
 
 ## Running it
 

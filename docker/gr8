@@ -13,17 +13,17 @@
 #   GR8_IMAGE   the image (default gr8: docker build -t gr8 . on one box, then docker save gr8 | ssh <box> docker load)
 #   GR8_USER    the account the container runs as (default: you). Running docker takes root-equivalent rights; the
 #               engine does not need them, so an account without sudo or docker can run it while you start it.
-#   GR8_SSH     the ssh directory the head's shim uses to reach the other boxes, mounted read-only as GR8_USER's ~/.ssh
-#               (default ~GR8_USER/.ssh). From the head, `ssh -o BatchMode=yes <peer> true` must work for every other
-#               peer address, with no prompt.
+#   GR8_SSH     TP=6: the ssh directory the head's shim uses to reach the other boxes, mounted read-only as GR8_USER's
+#               ~/.ssh (default ~GR8_USER/.ssh). From the head, `ssh -o BatchMode=yes <peer> true` must work for every
+#               other peer address, with no prompt. TP=4 and TP=3 use no ssh, and no ssh directory is mounted.
 #   G6_HOME     this box's working directory: out/, s2/, run/ and serve/ (default ~GR8_USER/gr8-docker). bin/ there is
 #               a link into the image, so it must not be a bare-metal build's bin/.
 #
 # The container: --network host and --pid host (the launcher's own check for another g6m4 on this box sees the host's
 # processes), the GPU, /dev/infiniband with IPC_LOCK and unlimited memlock, every other capability dropped, no new
-# privileges, a read-only image with a private /tmp, GR8_USER's uid, gid and ~/.ssh (read-only: the head's shim writes
-# to the other ranks over ssh, as on bare metal). The engine runs with oom_score_adj 1000: under memory pressure the
-# kernel ends the engine before sshd or the rest of the box.
+# privileges, a read-only image with a private /tmp, GR8_USER's uid and gid, and at TP=6 GR8_USER's ~/.ssh (read-only:
+# the TP=6 head's shim writes to the other ranks over ssh, as on bare metal). The engine runs with oom_score_adj 1000:
+# under memory pressure the kernel ends the engine before sshd or the rest of the box.
 set -eu
 IMAGE=${GR8_IMAGE:-gr8}
 NAME=gr8
@@ -99,10 +99,11 @@ while read -r kind path; do
 done <<< "$paths"
 [ -n "$home" ] && [ -n "$tp" ] || die "the options helper printed no G6_HOME or TP"
 case $tp in 4) bin=bin ;; 6) bin=bin6 ;; 3) bin=bin3 ;; *) die "TP=$tp: want 4, 6 or 3" ;; esac
-# the head's shim reaches the other boxes with these keys; a box without ~/.ssh can still run a rank and the read-only
+# TP=6 only: its head's shim reaches the other boxes over ssh with these keys (TP=4 and TP=3 pass requests over the
+# engine's control links, so their containers get no keys). A box without ~/.ssh can still run a rank and the read-only
 # commands. A named GR8_SSH must exist (docker says so), and so must another account's ~/.ssh if you cannot see it.
 mounts=()
-if [ -n "${GR8_SSH:-}" ] || [ "$user" != "$me" ] || [ -d "$uhome/.ssh" ]; then
+if [ "$tp" = 6 ] && { [ -n "${GR8_SSH:-}" ] || [ "$user" != "$me" ] || [ -d "$uhome/.ssh" ]; }; then
   mounts+=(--mount "type=bind,src=${GR8_SSH:-$uhome/.ssh},dst=$uhome/.ssh,readonly")
 fi
 for p in "${order[@]}"; do

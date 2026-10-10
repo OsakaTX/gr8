@@ -1,0 +1,147 @@
+#!/bin/bash
+# ./gr8 glm53 in the gr8 image: the same launcher, options, config file and checks as a bare-metal box, one container
+# per box. Run the same command on every box, from any directory (relative paths and ./cluster.env resolve there).
+#
+#   docker/gr8 up [OPTIONS] [@FILE]      start this box's container, follow the boot until the cluster serves
+#   docker/gr8 down | restart | status | logs | check | show-config | prepare | smoke | bench   as ./gr8 glm53 <command>
+#
+# OPTIONS are ./gr8 glm53's (KNOBS.md), from the command line, the config file and the environment as on bare metal. The
+# launcher finds this box's peer index and fabric rails the same way inside the container (host network, the host's
+# /sys/class/infiniband), so --peers, --ips/--ips2, --node-ip and the ports mean what they mean on bare metal.
+#
+# Environment for this script:
+#   GR8_IMAGE   the image (default gr8: docker build -t gr8 . on one box, then docker save gr8 | ssh <box> docker load)
+#   GR8_USER    the account the container runs as (default: you). Running docker takes root-equivalent rights; the
+#               engine does not need them, so an account without sudo or docker can run it while you start it.
+#   GR8_SSH     the ssh directory the head's shim uses to reach the other boxes, mounted read-only as GR8_USER's ~/.ssh
+#               (default ~GR8_USER/.ssh). From the head, `ssh -o BatchMode=yes <peer> true` must work for every other
+#               peer address, with no prompt.
+#   G6_HOME     this box's working directory: out/, s2/, run/ and serve/ (default ~GR8_USER/gr8-docker). bin/ there is
+#               a link into the image, so it must not be a bare-metal build's bin/.
+#
+# The container: --network host and --pid host (the launcher's own check for another g6m4 on this box sees the host's
+# processes), the GPU, /dev/infiniband with IPC_LOCK and unlimited memlock, every other capability dropped, no new
+# privileges, a read-only image with a private /tmp, GR8_USER's uid, gid and ~/.ssh (read-only: the head's shim writes
+# to the other ranks over ssh, as on bare metal). The engine runs with oom_score_adj 1000: under memory pressure the
+# kernel ends the engine before sshd or the rest of the box.
+set -eu
+IMAGE=${GR8_IMAGE:-gr8}
+NAME=gr8
+user=${GR8_USER:-$(id -un)}
+uhome=$(getent passwd "$user" | cut -d: -f6) || true
+[ -n "$uhome" ] || { echo "docker/gr8: no account $user" >&2; exit 2; }
+export G6_HOME=${G6_HOME:-$uhome/gr8-docker}
+
+die() { echo "docker/gr8: $*" >&2; exit 2; }
+usage() { sed -n '2,/^set -eu$/{/^set -eu$/d;s/^# \{0,1\}//;p;}' "$0"; }
+
+[ $# -gt 0 ] || { usage; exit 0; }
+cmd=$1; shift
+case $cmd in
+  -h|--help|help) usage; exit 0 ;;
+  up|down|restart|status|logs|check|show-config|prepare|smoke|bench) ;;
+  build|stage|packs) die "$cmd: the image is the build; rebuild it with docker build -t $IMAGE ." ;;
+  *) die "unknown command $cmd (docker/gr8 help)" ;;
+esac
+docker image inspect "$IMAGE" > /dev/null 2>&1 || die "no image $IMAGE: docker build -t $IMAGE . (or GR8_IMAGE=...)"
+
+uid=$(id -u "$user"); gid=$(id -g "$user")
+base=(--init --network host --pid host --user "$uid:$gid" -e HOME="$uhome"
+      -v /etc/passwd:/etc/passwd:ro -v /etc/group:/etc/group:ro -w "$PWD")
+
+# the launcher's options that are set in this shell, and every G6_* variable, reach the container as they would reach
+# a bare-metal launcher
+envs=()
+for k in $(docker run --rm --entrypoint python3 "$IMAGE" -c \
+    'import sys; sys.path.insert(0, "/opt/gr8/tools/launch"); import options; print(" ".join(options.KEYS))'); do
+  [ -n "${!k+x}" ] && envs+=(-e "$k")
+done
+for k in $(compgen -e); do
+  case $k in G6_*) envs+=(-e "$k") ;; esac
+done
+# the shim runs on the image's python3 (stdlib only), not a venv in G6_HOME; an explicit PY still wins
+[ -n "${PY+x}" ] || envs+=(-e PY=/usr/bin/python3)
+
+# the paths the launcher will read and write, from its own option parsing. smoke and bench take a URL and the bench's
+# own flags, not launcher options: only the config file and the environment name their paths
+popts=("$@")
+case $cmd in smoke|bench) popts=() ;; esac
+# Nothing below reads GR8_USER's files from the host (you may not be able to): the checks run in the container, as
+# GR8_USER, and --mount refuses a missing path where -v would create it, owned by root.
+home='' tp=''
+me=$(id -un)
+declare -A mode=([$PWD]=ro)
+order=("$PWD")
+add() {   # one mount per path; read-write wins
+  [ -n "${mode[$2]+x}" ] || order+=("$2")
+  [ "${mode[$2]:-}" = rw ] || mode[$2]=$1
+}
+while read -r kind path; do
+  case $kind in
+    home) home=$path ;;
+    tp) tp=$path ;;
+    rw) [ "$user" != "$me" ] || mkdir -p "$path"; add rw "$path" ;;
+    # a missing input: the launcher's check names it (when you can see GR8_USER's paths)
+    ro) [ "$user" != "$me" ] && [ ! -e "$path" ] || add ro "$path" ;;
+  esac
+done < <(docker run --rm "${base[@]}" --mount "type=bind,src=$PWD,dst=$PWD,readonly" "${envs[@]}" --entrypoint python3 "$IMAGE" \
+           /opt/gr8/docker/mounts.py ${popts[@]+"${popts[@]}"} || echo "fail")
+[ -n "$home" ] && [ -n "$tp" ] || die "could not read the options (the error is above)"
+case $tp in 4) bin=bin ;; 6) bin=bin6 ;; 3) bin=bin3 ;; *) die "TP=$tp: want 4, 6 or 3" ;; esac
+mounts=(--mount "type=bind,src=${GR8_SSH:-$uhome/.ssh},dst=$uhome/.ssh,readonly")
+for p in "${order[@]}"; do
+  if [ "${mode[$p]}" = rw ]; then mounts+=(--mount "type=bind,src=$p,dst=$p")
+  else mounts+=(--mount "type=bind,src=$p,dst=$p,readonly"); fi
+done
+
+run=("${base[@]}" "${envs[@]}" "${mounts[@]}" -e G6H="$home" --gpus all --device /dev/infiniband --ulimit memlock=-1
+     --cap-drop ALL --cap-add IPC_LOCK --security-opt no-new-privileges --read-only
+     --tmpfs "/tmp:rw,nosuid,nodev,size=1g,mode=1700,uid=$uid,gid=$gid")
+# in the container, as GR8_USER: bin/ is the image's engine for this TP
+prep="if [ -e \"\$G6H/bin\" ] && [ ! -L \"\$G6H/bin\" ]; then
+        echo \"docker/gr8: \$G6H/bin is a directory (a bare-metal build?): pick another G6_HOME\" >&2; exit 2; fi
+      ln -sfn /opt/gr8/$bin \"\$G6H/bin\" && mkdir -p \"\$G6H/out\""
+
+running() { [ -n "$(docker ps -q --filter "name=^$NAME\$")" ]; }
+
+up() {
+  running && die "container $NAME already runs on this box: docker/gr8 down first"
+  local t0 follow s
+  t0=$(date +%s)
+  # the supervisor's output goes to out/supervisor.log, as a bare-metal up writes it, and to docker logs
+  docker run -d --rm --name "$NAME" --oom-score-adj 1000 "${run[@]}" --entrypoint bash "$IMAGE" -c "$prep
+    exec > >(tee -a \"\$G6H/out/supervisor.log\") 2>&1
+    exec /opt/gr8/gr8 glm53 up --foreground \"\$@\"" bash "$@" > /dev/null
+  echo "container $NAME, log $home/out/supervisor.log"
+  docker logs -f "$NAME" 2>&1 &
+  follow=$!
+  trap 'kill $follow 2>/dev/null; echo; echo "the boot goes on in the container: docker/gr8 status, docker/gr8 logs supervisor, docker/gr8 down"; exit 130' INT
+  while :; do
+    sleep 1
+    if ! running; then
+      wait "$follow" 2>/dev/null || true
+      echo "docker/gr8: the container stopped (the reason is above, and in $home/out)" >&2
+      return 1
+    fi
+    # this boot's state only: an older gr8.state may still say serving
+    s=$(docker exec "$NAME" sh -c 'f=$G6H/out/gr8.state; [ -f "$f" ] && echo "$(stat -c %Y "$f") $(cat "$f")"' \
+        2>/dev/null) || true
+    if [ -n "$s" ] && [ "${s%% *}" -ge "$t0" ] && [[ $s == *'"state": "serving"'* ]]; then
+      sleep 1; kill "$follow" 2>/dev/null || true
+      return 0
+    fi
+  done
+}
+
+once() {
+  local tty=()
+  [ -t 0 ] && [ -t 1 ] && tty=(-it)
+  docker run --rm "${tty[@]}" "${run[@]}" --entrypoint bash "$IMAGE" -c "$prep
+    exec /opt/gr8/gr8 glm53 \"\$@\"" bash "$@"
+}
+
+case $cmd in
+  up) up "$@" ;;
+  restart) once down "$@" || true; up "$@" ;;
+  *) once "$cmd" "$@" ;;
+esac

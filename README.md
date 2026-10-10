@@ -51,6 +51,9 @@ MTP k=2 at temperature 0.7, one test window on one cluster.
   else holding much memory. A rank's weights take about 83 GB at TP=4 and 78 GB at TP=3. The KV pool and the step
   graphs need most of the rest.
 - A RoCE v2 fabric with two rails: each box's ConnectX-7 has one address on each PCIe root. We use one 200G switch.
+  At TP=3 or 4, `--shape ring` runs without one: each box's f0 port is cabled to the next box's f1 port, and at TP=4
+  the diagonal's writes are relayed by the box between, through a 32 MB ring per fabric (about 0.25 GB pinned per
+  rank). It costs about 10% of single-stream decode (4-5% at 4 streams). memlock must be unlimited.
 - A LAN between the boxes with TCP port 7340 open, and non-interactive ssh from the first box to the others (with
   their addresses in its `known_hosts`): the shim on the head hands each request to the other ranks over ssh.
 - Disk per box: about 90 GB at TP=4 (its experts, the 11 GB of dense and vocab files, the drafter) and about 85 GB at

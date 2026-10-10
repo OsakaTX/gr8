@@ -9,6 +9,21 @@
   and the rails as on bare metal. `GR8_USER` runs the container as an account without sudo or docker.
 - The runtime image has `jq`, which `./gr8 glm53 smoke` needs.
 
+## 2026-10-10: `--shape ring`: TP=3 and TP=4 without a switch
+
+- Each box's f0 port is cabled to the f1 port of the next box in `--peers` order. Every port shows up as two RDMA
+  devices, one per PCIe root. Neighbours are written directly on their own devices. At TP=4 the diagonal is reached
+  through the next rank: the origin writes the payload into a 32 MB relay ring on that rank and sends its ring position
+  and destination offset, and a relay thread there forwards the same bytes to the same offset, then returns a credit.
+  Writes of 40 bytes or less (the bulk flags) travel inside the SEND. The rings pin about 0.25 GB per rank at TP=4
+  (the first version mirrored each fabric's receive side, 5.2 GB per rank, which left too little memory for the
+  default CAP).
+- The launcher passes `--ring` and the LAN addresses as `--ips`: the fabric and S2 bootstraps go over the LAN.
+  `--ring-devs` names the four devices when they differ from the GB10 defaults. The relay thread takes the core 8
+  below `--proxy-cpu` (11 by default), below the seven other proxies.
+- Measured on four GB10s on a cable ring at 200G, beta 1 with the patch, MTP k=2, against a switch: c1 decode
+  38.5 vs 42.5 tok/s, c4 aggregate 69.2 vs 72.0, prefill 1,236-1,264 vs 1,243-1,318 tok/s.
+
 ## 2026-10-10: serving is S2 in every build that has it; no `--s2` flag
 
 - A DEC_S2 build (TP=4, TP=3) always serves through S2: `g6m4 --serve DIR --s2-port N ...`. `--s2 DIR` is gone, so a

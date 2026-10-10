@@ -36,6 +36,15 @@ def supervisor(*argv, rank=0, members=MEMBERS):
     return s
 
 
+class RingTests(unittest.TestCase):
+    @mock.patch.object(S, 'log')
+    def test_a_ring_uses_the_lan_for_its_rails(self, _):
+        s = supervisor('--shape', 'ring', '--node-ip', MEMBERS[2])
+        with mock.patch.object(S.fabric, 'rails', side_effect=AssertionError('no fabric discovery on a ring')):
+            s.rendezvous(4)
+        self.assertEqual((s.rank, s.rails), (2, (MEMBERS[2], MEMBERS[2])))
+
+
 class ControlPortTests(unittest.TestCase):
     @mock.patch.object(S, 'log')
     def test_requests_from_non_members_are_ignored(self, logged):

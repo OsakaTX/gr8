@@ -68,7 +68,7 @@ manifest instead.
 | name | flag | default | scope | meaning |
 |---|---|---|---|---|
 | `TP` | `--tp` | the number of peers | cluster | 4, 6 or 3; needed with mentat |
-| `SHAPE` | `--shape` | `mesh` | cluster | `mesh` (a switch). `ring` is refused: the engine has no ring fabric yet |
+| `SHAPE` | `--shape` | `mesh` | cluster | `mesh` (a switch), or `ring` (TP=3 or 4, no switch): each box's f0 port cabled to the next box's f1 port, in `--peers` order. Needs `--peers`, takes no `--ips` |
 | `PEERS` | `--peers` | none | cluster | the boxes' LAN addresses in rank order, the same on every box. The first is the head. `HOSTS` in an old config file is read as `PEERS` |
 | `MENTAT` | `--mentat` | `localhost` | box | find the boxes through the local mentat daemon (the default when `PEERS` is unset) |
 | `GROUP` | `--group` | `gr8-glm53` | cluster | the mentat group the boxes join |
@@ -84,7 +84,8 @@ manifest instead.
 | `MODEL_CACHE` | `--model-cache` | none | box | this box's local directory for its shard of the model set. Alone, it boots from the one set it holds |
 | `MODEL_DIR` | `--model-dir` | none | box | the tokenizer files, when the pack directory has no `tokenizer/` |
 | `G6_HOME` | `--g6-home` | the repo checkout | box | working directory: `bin/`, `out/`, `s2/`, `serve/`, `run/` |
-| `PROXY_CPU` | `--proxy-cpu` | 19 | box | CPU core of this rank's fabric proxy thread |
+| `PROXY_CPU` | `--proxy-cpu` | 19 | box | CPU core of this rank's fabric proxy thread. The other proxies take the 7 cores below it, and the ring's relay thread the one below those |
+| `RING_DEVS` | `--ring-devs` | the GB10 CX-7 names | box | `--shape ring`: this box's RDMA devices as relay-out,next,relay-in,prev (`rocep1s0f0,roceP2p1s0f0,rocep1s0f1,roceP2p1s0f1`) |
 | `NODE_IP` | `--node-ip` | found | box | this box's LAN address, when several peers are addresses of this box |
 | `CONTROL_PORT` | `--control-port` | 7340 | cluster | the supervisors' TCP port on the LAN (handshake, status, logs, down) |
 | `PORT` | `--port` | 8100 | cluster | the OpenAI API on the head |

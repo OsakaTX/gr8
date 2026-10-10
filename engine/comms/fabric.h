@@ -30,6 +30,11 @@ struct FabricConfig {
   size_t bulk_bytes = 0;
   int bulk_flags = 0;
   int xtrace = 0;                 // 1 = stage-0 trace records on this fabric when env G6_XTRACE=1 (xtrace.h); uniform layout only
+  // ring (relay.h): QPs to the two ring neighbours only, ring link i -> i + 1 on rail i % 2. At TP=4 a write to the
+  // diagonal is relayed by a neighbour's proxy, byte for byte. boot_ips: the addresses of the TCP bootstrap (the LAN),
+  // index = rank; empty = ips (a switch reaches every rank's rail 0).
+  bool ring = false;
+  std::vector<std::string> boot_ips;
 };
 
 // bulk mode kernel view (pinned host, device-mapped). flags[(f * nr + p) * 2 + {0, 1}] = {val, aux} written by peer p as

@@ -580,6 +580,8 @@ class Supervisor:
         env = self.engine_env(plan)
         argv = ['./bin/g6m4', '--rank', str(r), '--ips', ','.join(hs['ips']), '--ips2', ','.join(hs['ips2']),
                 '--proxy-cpu', o.get('PROXY_CPU'), *plan['args']]
+        if o.get('SHAPE') == 'ring':     # the ring reaches the head only over the LAN: bootstrap there
+            argv[1:1] = ['--ring', '--boot-ips', ','.join(hs['members'])]
         log(f'engine: {" ".join(plan["env"])} {" ".join(argv)}')
         with open(os.path.join(self.out, f'g6m4.r{r}.txt'), 'wb') as so, \
                 open(os.path.join(self.out, f'g6m4.r{r}.err'), 'wb') as se:

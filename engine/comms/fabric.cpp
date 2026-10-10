@@ -2,6 +2,7 @@
 #include "fabric.h"
 #include "bulk_proxy.h"
 #include "progress_cpus.h"
+#include "relay.h"
 #include "xtrace.h"
 
 #include <cuda_runtime.h>
@@ -17,6 +18,7 @@
 #include <sys/syscall.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -105,6 +107,11 @@ std::vector<char> allgather(int rank, int nr, const std::string& ip0, int port, 
   return all;
 }
 
+const std::string& boot_ip0(const FabricConfig& c) { return c.boot_ips.empty() ? c.ips[0] : c.boot_ips[0]; }
+
+// wr_id tags of the relay's own work requests (relay.h); data writes carry the QP index (< 8)
+constexpr uint64_t kRelayFwd = 1ull << 62, kRelayCredit = 1ull << 61;
+
 // G6_XTRACE proxy clock: CNTVCT_EL0 on ARM (GB10), rdtsc elsewhere; read only when the trace is on
 inline uint64_t xt_tick() {
 #if defined(__aarch64__)
@@ -145,7 +152,27 @@ struct Fabric::Impl {
   int pinned_cpu = -1;                               // CPU registered with progress_cpus.h (-1 = none)
   std::atomic<int> proxy_tid{0};                     // thread id of the running proxy, registered with progress_cpus.h (0 = none)
   std::atomic<bool> proxy_started{false};            // the proxy thread has pinned itself and registered its tid
-  int rail_of(int p, int me) const { return nrails == 1 ? 0 : (p + me) % 2; }
+  int rail_of(int p, int me) const {
+    if (nrails == 1) return 0;
+    if (ring) return ring_rail(me, p, nr);
+    return (p + me) % 2;
+  }
+  // ring (relay.h). via[p]: the QP that reaches p (p, or the neighbour that relays to p). At TP=4 this rank relays for
+  // one neighbour (rin_src, to rin_dst) and sends its own diagonal writes through rout_via. The relay area, at region
+  // offset rel_off: [kRelayHdrs headers | rel_ring data bytes | credits {hdr_done, data_done} from rout_via].
+  bool ring = false, relay = false;
+  std::vector<int> via;
+  int rin_src = -1, rin_dst = -1, rout_via = -1, rout_dst = -1;
+  size_t rel_off = 0, rel_bytes = 0, adv_off = 0;   // adv_off: region offset of the address peers write against
+  uint64_t rel_ring = 0;
+  RelayIn rin; RelayOut rout;
+  uint64_t credit_sent = 0; int credit_unsig = 0;
+  volatile RelayHdr* rel_hdr(uint64_t i) const { return (volatile RelayHdr*)(region + rel_off + kRelaySlot * (i % kRelayHdrs)); }
+  size_t rel_data_off() const { return rel_off + kRelaySlot * kRelayHdrs; }
+  char* rel_data() const { return region + rel_data_off(); }
+  volatile uint64_t* rel_credit() const { return (volatile uint64_t*)(rel_data() + rel_ring); }
+  // a peer's address for a region offset (identity layout: every rank's region has the same shape)
+  uint64_t remote(int p, size_t region_off) const { return peer[p].addr + region_off - adv_off; }
   // G6_XTRACE (xtrace.h). xenv: env on (WC error counters dumped for every fabric); xt: proxy stamps on this fabric
   bool xenv = false, xt = false, xdumped = false;
   unsigned long long* xgpu = nullptr;                // device records (dev_.xt), cudaMalloc'd
@@ -179,9 +206,27 @@ void Fabric::init(const FabricConfig& cfg) {
   }
   FCHECK(cfg_.rank >= 0 && cfg_.rank < nr && nr >= 2 && (I.bulk || (cfg_.ncoll > 0 && (I.var || cfg_.slot_bytes > 0))));
   I.nrails = cfg.ips2.empty() ? 1 : 2;
+  I.ring = cfg.ring;
+  I.via.resize(nr);
+  for (int p = 0; p < nr; p++) I.via[p] = I.ring ? ring_via(cfg.rank, p, nr) : p;
+  if (I.ring) {
+    FCHECK(nr == 3 || nr == 4);                         // TP=3: three cables, a full mesh; TP=4: a ring with diagonals
+    I.relay = nr == 4;
+    if (I.relay) {
+      const int me = cfg.rank;
+      I.rout_dst = (me + 2) % 4; I.rout_via = ring_via(me, I.rout_dst, 4);
+      for (int s = 0; s < 4; s++) if (s != me && ring_via(s, (s + 2) % 4, 4) == me) { I.rin_src = s; I.rin_dst = (s + 2) % 4; }
+      FCHECK(I.rin_src >= 0);
+      const char* e = getenv("G6_RELAY_MB");
+      I.rel_ring = (uint64_t)(e ? atoi(e) : 16) << 20;   // G6_RELAY_MB: the relay's data ring per fabric
+      FCHECK(I.rel_ring >= 2 * (uint64_t)kRelayChunk);
+      I.rel_bytes = (kRelaySlot * kRelayHdrs + I.rel_ring + 16 + 4095) & ~size_t(4095);
+    }
+  }
   if (I.bulk) {
     const size_t fl = (size_t)cfg.bulk_flags * nr * 16, db = (size_t)cfg.bulk_flags * 8;
     I.region_bytes = ((cfg.bulk_bytes + fl + 2 * db + 64) + 4095) & ~size_t(4095);
+    I.rel_off = I.region_bytes; I.region_bytes += I.rel_bytes;
     CUCHECK(cudaHostAlloc((void**)&I.region, I.region_bytes, cudaHostAllocMapped | cudaHostAllocPortable));
     memset(I.region, 0, I.region_bytes);
     char* bdev = nullptr; CUCHECK(cudaHostGetDevicePointer((void**)&bdev, I.region, 0));
@@ -201,6 +246,7 @@ void Fabric::init(const FabricConfig& cfg) {
   const size_t recv_bytes = I.var ? I.L.recv_bytes() : 2 * (size_t)cfg.ncoll * nr * stride;
   const size_t db_bytes = (size_t)cfg_.ncoll * 8;
   I.region_bytes = ((send_bytes + recv_bytes + db_bytes + 64) + 4095) & ~size_t(4095);
+  I.rel_off = I.region_bytes; I.region_bytes += I.rel_bytes;
   CUCHECK(cudaHostAlloc((void**)&I.region, I.region_bytes, cudaHostAllocMapped | cudaHostAllocPortable));
   memset(I.region, 0, I.region_bytes);
   char* base_dev = nullptr; CUCHECK(cudaHostGetDevicePointer((void**)&base_dev, I.region, 0));
@@ -218,6 +264,7 @@ void Fabric::init(const FabricConfig& cfg) {
   }
   }
   I.xenv = xtrace_env();
+  I.adv_off = (size_t)(dev_.recv - I.region);
 
   for (int r = 0; r < I.nrails; r++) {
     Rail& R = I.rails[r];
@@ -233,21 +280,21 @@ void Fabric::init(const FabricConfig& cfg) {
   I.qp.assign(nr, nullptr); I.unsignaled.assign(nr, 0);
   std::vector<QPInfo> mine(nr);
   for (int p = 0; p < nr; p++) {
-    if (p == cfg.rank) continue;
+    if (p == cfg.rank || I.via[p] != p) continue;       // ring: no QP to the diagonal
     Rail& R = I.rails[I.rail_of(p, cfg.rank)];
     ibv_qp_init_attr ia{}; ia.send_cq = R.cq; ia.recv_cq = R.cq; ia.qp_type = IBV_QPT_RC;
     ia.cap.max_send_wr = 2048; ia.cap.max_recv_wr = 1; ia.cap.max_send_sge = 1; ia.cap.max_recv_sge = 1;
-    if (I.bulk) ia.cap.max_inline_data = 64;            // bulk: 8-B flag writes go inline
+    if (I.bulk || I.relay) ia.cap.max_inline_data = 64; // bulk: 8-B flag writes; relay: 40-B headers and credits
     I.qp[p] = ibv_create_qp(R.pd, &ia); FCHECK(I.qp[p]);
     ibv_qp_attr at{}; at.qp_state = IBV_QPS_INIT; at.port_num = 1; at.qp_access_flags = IBV_ACCESS_REMOTE_WRITE;
     FCHECK(ibv_modify_qp(I.qp[p], &at, IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_PORT | IBV_QP_ACCESS_FLAGS) == 0);
     mine[p] = QPInfo{I.qp[p]->qp_num, (uint32_t)((cfg.rank * 131 + p * 7) & 0xffffff), R.mr->rkey, (uint64_t)dev_.recv, {}};
     memcpy(mine[p].gid, R.gid.raw, 16);
   }
-  auto all = allgather(cfg.rank, nr, cfg.ips[0], cfg.port, mine.data(), sizeof(QPInfo) * nr);
+  auto all = allgather(cfg.rank, nr, boot_ip0(cfg), cfg.port, mine.data(), sizeof(QPInfo) * nr);
   I.peer.resize(nr);
   for (int p = 0; p < nr; p++) {
-    if (p == cfg.rank) continue;
+    if (p == cfg.rank || I.via[p] != p) continue;
     QPInfo pi = ((QPInfo*)(all.data() + sizeof(QPInfo) * nr * p))[cfg.rank]; I.peer[p] = pi;
     Rail& R = I.rails[I.rail_of(p, cfg.rank)];
     ibv_qp_attr at{}; at.qp_state = IBV_QPS_RTR; at.path_mtu = IBV_MTU_4096; at.dest_qp_num = pi.qpn; at.rq_psn = pi.psn;
@@ -258,12 +305,18 @@ void Fabric::init(const FabricConfig& cfg) {
     ibv_qp_attr as{}; as.qp_state = IBV_QPS_RTS; as.timeout = 14; as.retry_cnt = 7; as.rnr_retry = 7; as.sq_psn = mine[p].psn; as.max_rd_atomic = 1;
     FCHECK(ibv_modify_qp(I.qp[p], &as, IBV_QP_STATE | IBV_QP_TIMEOUT | IBV_QP_RETRY_CNT | IBV_QP_RNR_RETRY | IBV_QP_SQ_PSN | IBV_QP_MAX_QP_RD_ATOMIC) == 0);
   }
+  if (I.ring)
+    fprintf(stderr, "[fabric r%d] ring: QPs to %d (rail %d) and %d (rail %d)%s\n", cfg.rank, ring_prev(cfg.rank, nr),
+            I.rail_of(ring_prev(cfg.rank, nr), cfg.rank), ring_next(cfg.rank, nr), I.rail_of(ring_next(cfg.rank, nr), cfg.rank),
+            I.relay ? (" | diagonal " + std::to_string(I.rout_dst) + " via " + std::to_string(I.rout_via) + ", relaying " +
+                       std::to_string(I.rin_src) + " -> " + std::to_string(I.rin_dst) + ", " +
+                       std::to_string(I.rel_ring >> 20) + " MB ring").c_str() : "");
   barrier();
 }
 
 void Fabric::barrier() {
   static int bump = 1;
-  char z = 0; allgather(cfg_.rank, nranks(), cfg_.ips[0], cfg_.port + (bump++ % 3) + 1, &z, 1);
+  char z = 0; allgather(cfg_.rank, nranks(), boot_ip0(cfg_), cfg_.port + (bump++ % 3) + 1, &z, 1);
 }
 
 void Fabric::enqueue_step(unsigned long long step, const std::vector<uint32_t>& sizes) { enqueue_step(step, sizes, Rs{}); }
@@ -333,10 +386,59 @@ void Fabric::start_proxy() {
     }
     I.proxy_started.store(true, std::memory_order_release);
     const int me = cfg_.rank, nr = I.nr;
+    volatile unsigned* err = dev_.error;
+    auto halted = [&] { return I.stop.load(std::memory_order_relaxed) || *err != 0; };
+    // ibv_poll_cq for rail r, minus the relay's own completions (relay.h), which are handled here
+    auto cq_poll = [&](int r, ibv_wc* out, int max) -> int {
+      ibv_wc wc[32]; const int n = ibv_poll_cq(I.rails[r].cq, max < 32 ? max : 32, wc);
+      if (n < 0) return n;
+      int k = 0;
+      for (int i = 0; i < n; i++) {
+        if (!(wc[i].wr_id & (kRelayFwd | kRelayCredit))) { out[k++] = wc[i]; continue; }
+        if (wc[i].status != IBV_WC_SUCCESS) {
+          fprintf(stderr, "[fabric r%d] relay %s WC error %s\n", me, wc[i].wr_id & kRelayFwd ? "forward" : "credit", ibv_wc_status_str(wc[i].status));
+          __sync_val_compare_and_swap(err, 0u, 0x75000001u);
+          return -1;
+        }
+        if (wc[i].wr_id & kRelayFwd) I.rin.completed();
+      }
+      return k;
+    };
+    // relay for rin_src: forward each header that has landed, in order, then return credits (every 32 headers, or when
+    // nothing is in flight)
+    auto relay_poll = [&] {
+      if (!I.relay) return;
+      RelayIn& in = I.rin;
+      const int d = I.rin_dst, s = I.rin_src;
+      while (in.fly.size() < 128) {
+        volatile RelayHdr* hp = I.rel_hdr(in.next);
+        if (hp->seq != in.next + 1) break;
+        std::atomic_thread_fence(std::memory_order_acquire);
+        RelayHdr h; memcpy(&h, const_cast<RelayHdr*>(hp), sizeof h);
+        ibv_sge sge; ibv_send_wr wr{}, *bad;
+        wr.sg_list = &sge; wr.num_sge = 1; wr.opcode = IBV_WR_RDMA_WRITE; wr.wr_id = kRelayFwd;
+        wr.send_flags = IBV_SEND_SIGNALED;
+        wr.wr.rdma.remote_addr = I.peer[d].addr + h.dest_off; wr.wr.rdma.rkey = I.peer[d].rkey;
+        if (h.inl) { sge = ibv_sge{(uint64_t)&h.ival, 8, 0}; wr.send_flags |= IBV_SEND_INLINE; }
+        else sge = ibv_sge{(uint64_t)(I.rel_data() + h.data_pos % I.rel_ring), h.len, I.rails[I.rail_of(d, me)].mr->lkey};
+        FCHECK(ibv_post_send(I.qp[d], &wr, &bad) == 0);
+        in.next++; in.forwarded(h);
+      }
+      if (in.hdr_done != I.credit_sent && (in.hdr_done - I.credit_sent >= 32 || in.fly.empty())) {
+        uint64_t cr[2] = {in.hdr_done, in.data_done};
+        ibv_sge sge{(uint64_t)cr, 16, 0}; ibv_send_wr wr{}, *bad;
+        wr.sg_list = &sge; wr.num_sge = 1; wr.opcode = IBV_WR_RDMA_WRITE; wr.wr_id = kRelayCredit;
+        const bool sig = ++I.credit_unsig >= 16; if (sig) I.credit_unsig = 0;
+        wr.send_flags = IBV_SEND_INLINE | (sig ? IBV_SEND_SIGNALED : 0);
+        wr.wr.rdma.remote_addr = I.remote(s, I.rel_data_off() + I.rel_ring); wr.wr.rdma.rkey = I.peer[s].rkey;
+        FCHECK(ibv_post_send(I.qp[s], &wr, &bad) == 0);
+        I.credit_sent = in.hdr_done;
+      }
+    };
     // bulk mode: drain completions until peer p has room for one more WR (signaled every 64 WRs, wr_id = peer);
     // CQ error / bad completion / 60 s without a completion -> error word (bulk_proxy.h)
     auto cqpoll = [&](int r, BulkCompl* out, int max) -> int {
-      ibv_wc wc[32]; const int n = ibv_poll_cq(I.rails[r].cq, max < 32 ? max : 32, wc);
+      ibv_wc wc[32]; const int n = cq_poll(r, wc, max < 32 ? max : 32);
       for (int i = 0; i < n; i++) {
         out[i] = BulkCompl{wc[i].wr_id, wc[i].status == IBV_WC_SUCCESS};
         if (wc[i].status != IBV_WC_SUCCESS) { I.wc_count(r, (int)wc[i].wr_id, wc[i].status); fprintf(stderr, "[fabric r%d] bulk WC error %s (peer %d)\n", me, ibv_wc_status_str(wc[i].status), (int)wc[i].wr_id); }
@@ -363,9 +465,78 @@ void Fabric::start_proxy() {
       if (sig) { I.batches[p].push_back(I.unsignaled[p]); I.unsignaled[p] = 0; }
       return true;
     };
+    // everything the proxy does while it waits: relay, and reap completions (bulk: into the per-peer accounting)
+    auto service = [&] {
+      relay_poll();
+      if (I.bulk) {
+        int got = 0, bad = -1;
+        if (const unsigned e = bulk_reap(I.nrails, I.inflight, I.batches, cqpoll, &got, &bad)) __sync_val_compare_and_swap(err, 0u, e);
+        return;
+      }
+      for (int r = 0; r < I.nrails; r++) {
+        ibv_wc wc[32]; int n;
+        while ((n = cq_poll(r, wc, 32)) > 0)
+          for (int i = 0; i < n; i++)
+            if (wc[i].status != IBV_WC_SUCCESS) { I.wc_count(r, (int)wc[i].wr_id, wc[i].status); fprintf(stderr, "[fabric r%d] WC error %s\n", me, ibv_wc_status_str(wc[i].status)); __sync_val_compare_and_swap(err, 0u, 0x71000000u); }
+        if (n < 0) __sync_val_compare_and_swap(err, 0u, kBulkCqError);
+      }
+    };
+    // collective writes: signaled every 256 per QP, wr_id = the QP index
+    auto upost = [&](int q, ibv_send_wr& wr) -> bool {
+      const bool sig = ++I.unsignaled[q] >= 256; if (sig) I.unsignaled[q] = 0;
+      wr.send_flags |= sig ? IBV_SEND_SIGNALED : 0; wr.wr_id = (uint64_t)q;
+      ibv_send_wr* bad = nullptr;
+      FCHECK(ibv_post_send(I.qp[q], &wr, &bad) == 0);
+      return true;
+    };
+    // a write to the diagonal: payload (in chunks) then header into rout_via's relay inbox (relay.h). post_q posts on a
+    // QP with that path's accounting (upost or bulk_post). false = stopped, or no credit for 60 s (error word set)
+    auto relay_send = [&](const char* src, uint32_t len, uint64_t off, bool inl, uint64_t ival, auto&& post_q) -> bool {
+      const int v = I.rout_via;
+      const uint32_t lkey = I.rails[I.rail_of(v, me)].mr->lkey;
+      uint32_t done = 0;
+      do {
+        const uint32_t n = inl ? 0 : std::min(len - done, kRelayChunk);
+        uint64_t pos;
+        const auto t0 = std::chrono::steady_clock::now();
+        while (!I.rout.reserve(n, I.rel_ring, I.rel_credit()[0], I.rel_credit()[1], &pos)) {
+          service();
+          if (halted()) return false;
+          if (std::chrono::steady_clock::now() - t0 > std::chrono::seconds(60)) {
+            fprintf(stderr, "[fabric r%d] relay: no credit from %d for 60 s\n", me, v);
+            __sync_val_compare_and_swap(err, 0u, 0x75000002u); return false;
+          }
+        }
+        if (n) {
+          ibv_sge sge{(uint64_t)(src + done), n, lkey}; ibv_send_wr wr{};
+          wr.sg_list = &sge; wr.num_sge = 1; wr.opcode = IBV_WR_RDMA_WRITE;
+          wr.wr.rdma.remote_addr = I.remote(v, I.rel_data_off() + pos % I.rel_ring); wr.wr.rdma.rkey = I.peer[v].rkey;
+          if (!post_q(v, wr)) return false;
+        }
+        RelayHdr h{off + done, pos, ival, inl ? 8u : n, inl ? 1u : 0u, I.rout.next_hdr};
+        ibv_sge sge{(uint64_t)&h, sizeof h, 0}; ibv_send_wr wr{};
+        wr.sg_list = &sge; wr.num_sge = 1; wr.opcode = IBV_WR_RDMA_WRITE; wr.send_flags = IBV_SEND_INLINE;
+        wr.wr.rdma.remote_addr = I.remote(v, I.rel_off + kRelaySlot * ((h.seq - 1) % kRelayHdrs)); wr.wr.rdma.rkey = I.peer[v].rkey;
+        if (!post_q(v, wr)) return false;
+        done += n;
+      } while (!inl && done < len);
+      return true;
+    };
+    // one RDMA write of len bytes to peer p, at off from p's advertised address: direct to a ring neighbour (or any
+    // peer on a mesh), relayed to the diagonal. inl: write the 8 bytes of ival inline instead of src.
+    auto put = [&](int p, const char* src, uint32_t len, uint64_t off, bool inl, uint64_t ival, auto&& post_q) -> bool {
+      if (I.via[p] != p) return relay_send(src, len, off, inl, ival, post_q);
+      ibv_sge sge; ibv_send_wr wr{};
+      wr.sg_list = &sge; wr.num_sge = 1; wr.opcode = IBV_WR_RDMA_WRITE;
+      if (inl) { sge = ibv_sge{(uint64_t)&ival, 8, 0}; wr.send_flags = IBV_SEND_INLINE; }
+      else sge = ibv_sge{(uint64_t)src, len, I.rails[I.rail_of(p, me)].mr->lkey};
+      wr.wr.rdma.remote_addr = I.peer[p].addr + off; wr.wr.rdma.rkey = I.peer[p].rkey;
+      return post_q(p, wr);
+    };
     auto spin = [&](volatile unsigned long long* w, unsigned long long want, unsigned code) -> bool {
       auto t0 = std::chrono::steady_clock::now();
       while (*w < want) {
+        if (I.relay) service();
         if (I.stop.load(std::memory_order_relaxed) || *I.bd.error) return false;
         if (std::chrono::steady_clock::now() - t0 > std::chrono::seconds(60)) {
           fprintf(stderr, "[fabric r%d] bulk proxy TIMEOUT code %08x (want %llu have %llu)\n", me, code, want, (unsigned long long)*w);
@@ -392,21 +563,12 @@ void Fabric::start_proxy() {
       for (int k = 1; k < nr; k++) {
         const int p = (me + k) % nr;                    // stagger the peer order across ranks
         if (!bulk_to(b.peer, p)) continue;              // one-peer job (BulkJob::peer)
-        Rail& R = I.rails[I.rail_of(p, me)];
-        for (const auto& rg : b.ranges) {
-          ibv_sge sge{(uint64_t)(I.bd.bulk + rg.first), rg.second, R.mr->lkey};
-          ibv_send_wr wr{}; wr.sg_list = &sge; wr.num_sge = 1; wr.opcode = IBV_WR_RDMA_WRITE;
-          wr.wr.rdma.remote_addr = I.peer[p].addr + rg.first; wr.wr.rdma.rkey = I.peer[p].rkey;
-          if (!bulk_post(p, wr)) return false;
-        }
+        for (const auto& rg : b.ranges)
+          if (!put(p, I.bd.bulk + rg.first, rg.second, rg.first, false, 0, bulk_post)) return false;
         if (b.post_flag >= 0)
-          for (const FlagWrite& w : fw) {                // aux, then val: two ordered 8-B inline writes (bulk_proxy.h)
-            ibv_sge sge{(uint64_t)&w.value, 8, 0};
-            ibv_send_wr wr{}; wr.sg_list = &sge; wr.num_sge = 1; wr.opcode = IBV_WR_RDMA_WRITE; wr.send_flags = IBV_SEND_INLINE;
-            wr.wr.rdma.remote_addr = I.peer[p].addr + (uint64_t)((char*)(I.bd.flags + ((size_t)b.post_flag * nr + me) * 2 + w.word) - I.bd.bulk);
-            wr.wr.rdma.rkey = I.peer[p].rkey;
-            if (!bulk_post(p, wr)) return false;
-          }
+          for (const FlagWrite& w : fw)                  // aux, then val: two ordered 8-B inline writes (bulk_proxy.h)
+            if (!put(p, nullptr, 8, (uint64_t)((char*)(I.bd.flags + ((size_t)b.post_flag * nr + me) * 2 + w.word) - I.bd.bulk),
+                     true, w.value, bulk_post)) return false;
       }
       return true;
     };
@@ -415,6 +577,7 @@ void Fabric::start_proxy() {
       {
         std::unique_lock<std::mutex> lk(I.mu);
         // busy-ish wait: spin briefly on the queue so the next step is picked up without a futex wake
+        if (I.q.empty() && I.relay) { lk.unlock(); service(); if (halted()) return; continue; }   // a relay never sleeps
         if (I.q.empty()) I.cv.wait_for(lk, std::chrono::microseconds(200), [&] { return !I.q.empty() || I.stop.load(); });
         if (I.q.empty()) continue;
         job = std::move(I.q.front()); I.q.pop_front();
@@ -427,6 +590,7 @@ void Fabric::start_proxy() {
         volatile unsigned long long* db = dev_.doorbell + c;
         auto t0 = std::chrono::steady_clock::now();
         while (*db != seq) {
+          if (I.relay) service();
           if (I.stop.load(std::memory_order_relaxed)) return;
           if (*dev_.error) return;
           if (std::chrono::steady_clock::now() - t0 > std::chrono::seconds(30)) {
@@ -449,14 +613,7 @@ void Fabric::start_proxy() {
           for (int p = 0; p < nr; p++) {
             const int j = L.slot_of(c, p, me);
             if (j < 0) continue;
-            Rail& R = I.rails[I.rail_of(p, me)];
-            ibv_sge sge{(uint64_t)src, bytes + 8, R.mr->lkey};
-            ibv_send_wr wr{}, *bad; wr.sg_list = &sge; wr.num_sge = 1; wr.opcode = IBV_WR_RDMA_WRITE;
-            wr.wr.rdma.remote_addr = I.peer[p].addr + L.recv_at(c, par, j);
-            wr.wr.rdma.rkey = I.peer[p].rkey;
-            bool sig = ++I.unsignaled[p] >= 256; if (sig) I.unsignaled[p] = 0;
-            wr.send_flags = sig ? IBV_SEND_SIGNALED : 0;
-            FCHECK(ibv_post_send(I.qp[p], &wr, &bad) == 0);
+            if (!put(p, src, bytes + 8, L.recv_at(c, par, j), false, 0, upost)) return;
           }
         } else {
         const bool rs = bit(job.rs_mask, c);
@@ -466,26 +623,18 @@ void Fabric::start_proxy() {
         if (xr) xr[1] = xr[5] = xt_tick();
         for (int p = 0; p < nr; p++) {
           if (p == me || (rs && bit(job.p2p, c) && p != job.peer)) continue;   // p2p: one peer only
-          Rail& R = I.rails[I.rail_of(p, me)];
           char* sp = rs ? src + p * job.rs_ss : src;             // reduce-scatter: peer p gets slice p only
           const uint32_t nb = rs ? job.rs_bytes[p] : bytes;
           if (rs) *(volatile unsigned long long*)(sp + nb) = seq;
-          ibv_sge sge{(uint64_t)sp, nb + 8, R.mr->lkey};
-          ibv_send_wr wr{}, *bad; wr.sg_list = &sge; wr.num_sge = 1; wr.opcode = IBV_WR_RDMA_WRITE;
-          wr.wr.rdma.remote_addr = I.peer[p].addr + (((size_t)par * cfg_.ncoll + c) * nr + me) * dev_.stride;
-          wr.wr.rdma.rkey = I.peer[p].rkey;
-          bool sig = ++I.unsignaled[p] >= 256; if (sig) I.unsignaled[p] = 0;
-          wr.send_flags = sig ? IBV_SEND_SIGNALED : 0;
-          wr.wr_id = (uint64_t)p;                       // peer, for the per-QP WC error counters
-          const int xrl = I.rail_of(p, me);
+          const int xrl = I.rail_of(I.via[p], me);
           if (xr && !xr[xrl * 4 + 2]) xr[xrl * 4 + 2] = xt_tick();
-          FCHECK(ibv_post_send(I.qp[p], &wr, &bad) == 0);
+          if (!put(p, sp, nb + 8, (((size_t)par * cfg_.ncoll + c) * nr + me) * dev_.stride, false, 0, upost)) return;
           if (xr) xr[xrl * 4 + 3] = xt_tick();
         }
         }
         for (int r = 0; r < I.nrails; r++) {
           ibv_wc wc[32]; int n;
-          while ((n = ibv_poll_cq(I.rails[r].cq, 32, wc)) > 0)
+          while ((n = cq_poll(r, wc, 32)) > 0)
             for (int i = 0; i < n; i++) if (wc[i].status != IBV_WC_SUCCESS) { I.wc_count(r, (int)wc[i].wr_id, wc[i].status); fprintf(stderr, "[fabric r%d] WC error %s\n", me, ibv_wc_status_str(wc[i].status)); *dev_.error = 0x71000000u; return; }
           if (n < 0) { fprintf(stderr, "[fabric r%d] ibv_poll_cq failed (%d)\n", me, n); *dev_.error = kBulkCqError; return; }   // fail closed, as the bulk path
         }

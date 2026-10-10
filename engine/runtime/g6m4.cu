@@ -8,6 +8,8 @@
 // step without host messages; fab.barrier() after the load lines the first step up.
 //
 // g6m4 --rank R --ips a,b,.. [--ips2 a,b,..] [--proxy-cpu N] --manifest rankR.manifest.json --pack rankR.pack|-
+//      [--ring [--boot-ips a,b,..]]  ring fabric (engine/comms/relay.h): QPs to the ring neighbours only, the diagonal
+//                     relayed; the fabric and S2 bootstraps go to --boot-ips (the LAN) instead of --ips
 //      [--image]      stream the pack straight into one device image (g6::DevImage; needed for a full 60 GB pack)
 //      [--v2 DIR --v2-slices DIR --v2-widths FILE]  with --image and the Rust loader: --manifest/--pack is a base pack
 //                     whose routed experts the exlr8 v2 experts replace, read from the raw width files in DIR at the
@@ -128,6 +130,8 @@ int main(int argc, char** argv)
         if (a == "--rank") cfg.rank = atoi(next().c_str());
         else if (a == "--ips") cfg.ips = split(next(), ',');
         else if (a == "--ips2") cfg.ips2 = split(next(), ',');
+        else if (a == "--ring") cfg.ring = true;
+        else if (a == "--boot-ips") cfg.boot_ips = split(next(), ',');
         else if (a == "--proxy-cpu") cfg.proxy_cpu = atoi(next().c_str());
         else if (a == "--manifest") manifest = next();
         else if (a == "--pack") packfile = next();
@@ -861,7 +865,7 @@ int main(int argc, char** argv)
             bc.rank = (unsigned)R;
             bc.ranks = (unsigned)cfg.ips.size();
             bc.timeout = getenv("G6_S2_TIMEOUT") ? (unsigned)atoi(getenv("G6_S2_TIMEOUT")) : 120;
-            bc.head_ip = cfg.ips[0];
+            bc.head_ip = cfg.boot_ips.empty() ? cfg.ips[0] : cfg.boot_ips[0];
             bc.directory = s2dir;
             bc.port = (uint16_t)s2port;
             bc.runtime_signature = "g6m4 s2 below " + std::to_string(s2_below) + " cap " + std::to_string(cap) + " layers " + layers_s +

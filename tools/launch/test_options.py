@@ -110,7 +110,8 @@ class ValidateTests(unittest.TestCase):
         self.assertIn(want, str(e.exception))
 
     def test_refusals(self):
-        self.check(['--peers', PEERS, '--shape', 'ring'], 'ring is not supported yet')
+        self.check(['--peers', PEERS, '--shape', 'star'], 'want mesh or ring')
+        self.check(['--peers', ','.join(f'10.0.0.{i}' for i in range(1, 7)), '--shape', 'ring'], 'TP=3 or 4')
         self.check(['--peers', PEERS, '--tp', '5'], 'want 4, 6 or 3')
         self.check(['--peers', PEERS, '--tp', '6'], 'names 4 boxes for --tp 6')
         self.check(['--mentat', 'localhost'], '--tp is needed')

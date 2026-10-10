@@ -21,6 +21,8 @@ g++ -O2 -std=c++17 -I engine/kernels engine/tests/test_topk.cpp -o "$T/test_topk
 "$T/test_topk"
 g++ -std=c++17 -O2 -pthread -I engine/runtime/s2 engine/runtime/s2/tests/control_idle_test.cpp -o "$T/control_idle_test"
 "$T/control_idle_test"     # the socketpair cases. The silent-peer case needs a network namespace.
+g++ -std=c++17 -O2 -fsanitize=address,undefined -I engine/comms engine/comms/tests/relay_test.cpp -o "$T/relay_test"
+"$T/relay_test"
 g++ -std=c++20 -O1 -pthread -I engine/comms tools/health/test_progress_cpus.cpp -o "$T/test_progress_cpus"
 "$T/test_progress_cpus"    # needs 3 or more CPUs
 

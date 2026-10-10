@@ -21,7 +21,8 @@ REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)
 # (scripts/engine_args.sh). The flag is --<key in lower case, _ as ->, except where FLAGS says otherwise.
 KEYS = {
     'TP': ('cluster', None, 'tensor-parallel size: 4, 6 or 3'),
-    'SHAPE': ('cluster', 'mesh', 'fabric shape: mesh (a switch); ring is not supported yet'),
+    'SHAPE': ('cluster', 'mesh', "fabric shape: mesh (a switch), or ring (TP=3 or 4, no switch: each box's f0 port "
+                                 "cabled to the f1 port of the next box in --peers order, the last to the first)"),
     'PEERS': ('cluster', None, 'LAN addresses of every box in rank order; the first is the head'),
     'MENTAT': ('box', None, "the local mentat daemon (localhost) to find the other boxes through"),
     'GROUP': ('cluster', 'gr8-glm53', 'mentat group the boxes join'),
@@ -39,6 +40,8 @@ KEYS = {
     'MODEL_DIR': ('box', None, 'tokenizer directory, when the model directory has none'),
     'G6_HOME': ('box', REPO, 'working directory: bin/, out/, s2/, serve/, run/'),
     'PROXY_CPU': ('box', '19', "CPU core for this rank's fabric proxy thread"),
+    'RING_DEVS': ('box', None, "--shape ring: this box's RDMA devices as relay-out,next,relay-in,prev (default "
+                               'rocep1s0f0,roceP2p1s0f0,rocep1s0f1,roceP2p1s0f1)'),
     'NODE_IP': ('box', None, "this box's LAN address, when the peer list cannot tell"),
     'PY': ('box', None, 'python for the shim (default $G6_HOME/venv/bin/python)'),
     'FRONT': ('box', None, 'front end: rs or py'),
@@ -266,13 +269,18 @@ def validate(o):
         raise OptionError('PLAIN=1 (the one-request loop) is retired at TP=4 and TP=3, and TP=6 never used it: unset it')
     if tp not in ('3', '4', '6'):
         raise OptionError(f'--tp {tp}: want 4, 6 or 3')
+    if o.get('SHAPE') not in ('mesh', 'ring'):
+        raise OptionError(f'--shape {o.get("SHAPE")}: want mesh or ring')
     if o.get('SHAPE') == 'ring':
-        raise OptionError('--shape ring is not supported yet. The engine connects every rank to rank 0 over the fabric '
-                          'and writes to every peer directly, which a ring has no cable for. It needs a LAN bootstrap, '
-                          'per-peer rails and a relayed or ring all-reduce in engine/comms/fabric.cpp. Use --shape mesh '
-                          '(a switch).')
-    if o.get('SHAPE') != 'mesh':
-        raise OptionError(f'--shape {o.get("SHAPE")}: want mesh')
+        if tp not in ('3', '4'):
+            raise OptionError(f'--shape ring: TP=3 or 4, not {tp}')
+        if mode(o) != 'peers':
+            raise OptionError('--shape ring needs --peers: their order is the cable order')
+        if o.get('IPS'):
+            raise OptionError('--shape ring takes no --ips/--ips2: the engine finds its devices by name (--ring-devs) '
+                              'and bootstraps over the LAN')
+    if o.get('RING_DEVS') and len(split_list(o.get('RING_DEVS'))) != 4:
+        raise OptionError(f'--ring-devs {o.get("RING_DEVS")}: want four devices')
     if mode(o) == 'peers' and len(split_list(o.get('PEERS'))) != int(tp):
         raise OptionError(f'--peers names {len(split_list(o.get("PEERS")))} boxes for --tp {tp}')
     for k in ('IPS', 'IPS2'):

@@ -428,11 +428,13 @@ class Supervisor:
                 raise Stop(1, f'this box ({node_ip}) is not among the members {",".join(self.members)}')
             self.rank, self.lan = self.members.index(node_ip), node_ip
             log(f'mentat group {group}: {",".join(self.members)}; this box is rank {self.rank}')
-            if not o.get('IPS'):
+            if not o.get('IPS') and o.get('SHAPE') != 'ring':
                 self.rails = ranks[self.rank][2]
                 for p in mentat.probe_problems(local, ranks, node_ip, self.rails):
                     log(f'warning: {p}')
-        if o.get('IPS'):
+        if o.get('SHAPE') == 'ring':    # no switch: the engine bootstraps over the LAN and finds its devices by name
+            self.rails = (self.lan, self.lan)
+        elif o.get('IPS'):
             self.rails = (opt.split_list(o.get('IPS'))[self.rank], opt.split_list(o.get('IPS2'))[self.rank])
         elif opt.mode(o) == 'peers':
             try:
@@ -580,6 +582,8 @@ class Supervisor:
         env = self.engine_env(plan)
         argv = ['./bin/g6m4', '--rank', str(r), '--ips', ','.join(hs['ips']), '--ips2', ','.join(hs['ips2']),
                 '--proxy-cpu', o.get('PROXY_CPU'), *plan['args']]
+        if o.get('SHAPE') == 'ring':
+            argv[1:1] = ['--ring', *(['--ring-devs', o.get('RING_DEVS')] if o.get('RING_DEVS') else [])]
         log(f'engine: {" ".join(plan["env"])} {" ".join(argv)}')
         with open(os.path.join(self.out, f'g6m4.r{r}.txt'), 'wb') as so, \
                 open(os.path.join(self.out, f'g6m4.r{r}.err'), 'wb') as se:

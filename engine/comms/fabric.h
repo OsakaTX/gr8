@@ -30,6 +30,11 @@ struct FabricConfig {
   size_t bulk_bytes = 0;
   int bulk_flags = 0;
   int xtrace = 0;                 // 1 = stage-0 trace records on this fabric when env G6_XTRACE=1 (xtrace.h); uniform layout only
+  // switchless ring (fabric.cpp, RelayHdr): QPs on four local devices to the two cabled neighbours, and at TP=4 the
+  // diagonal relayed by the next rank. ips then only says where the TCP bootstrap goes (the LAN).
+  bool ring = false;
+  std::vector<std::string> ring_devs;  // relay-out, direct-next, relay-in, direct-prev (empty = the GB10 CX-7 names)
+  int relay_cpu = -1;                  // pin the relay thread to this CPU (-1 = no pinning)
 };
 
 // bulk mode kernel view (pinned host, device-mapped). flags[(f * nr + p) * 2 + {0, 1}] = {val, aux} written by peer p as

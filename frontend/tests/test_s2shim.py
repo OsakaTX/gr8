@@ -129,6 +129,29 @@ class UnitTests(unittest.TestCase):
             self.assertEqual(g6s2shim.scan_numbers(d, 'req'), 10)
             self.assertEqual(g6s2shim.scan_numbers(d + '/none', 'req'), 0)
 
+    def test_rank_dirs(self):
+        ok = ['/g6/s2', '/g6/s2b', 'box2:/home/g6/s2', 'user@192.0.2.3:/srv/g6.d/s2', 'box3:/home/jos\u00e9/my g6/s2']
+        self.assertIsNone(g6s2shim.check_rank_dirs(ok))
+        self.assertIn('rank 0', g6s2shim.check_rank_dirs(['box1:/g6/s2']))
+        for bad in ('-oProxyCommand=x:/g6', ':/g6', 'box2:g6/s2', 'box2:/g6/s2\nid', 'box 2:/g6'):
+            self.assertIsNotNone(g6s2shim.check_rank_dirs(['/g6/s2', bad]), repr(bad))
+
+    def test_remote_commands(self):
+        # a plain path goes out exactly as before
+        self.assertEqual(g6s2shim.remote_write_cmd('/g6/s2', 'req.7'),
+                         'cat > /g6/s2/req.7.tmp && mv /g6/s2/req.7.tmp /g6/s2/req.7')
+        self.assertEqual(g6s2shim.remote_quit_cmd('/g6/s2'), 'touch /g6/s2/quit')
+        # anything else reaches the remote shell as one word: run the commands through sh, as sshd does
+        with tempfile.TemporaryDirectory() as t:
+            d = os.path.join(t, "s2; touch canary; $(touch canary) `touch canary` 'q\" *")
+            os.mkdir(d)
+            subprocess.run(['sh', '-c', g6s2shim.remote_write_cmd(d, 'req.1')], cwd=t, input=b'hello\n', check=True)
+            subprocess.run(['sh', '-c', g6s2shim.remote_quit_cmd(d)], cwd=t, check=True)
+            self.assertEqual(sorted(os.listdir(d)), ['quit', 'req.1'])
+            with open(os.path.join(d, 'req.1'), 'rb') as f:
+                self.assertEqual(f.read(), b'hello\n')
+            self.assertEqual(os.listdir(t), [os.path.basename(d)])   # nothing ran: no canary, no stray files
+
 
 class S2Base(unittest.IsolatedAsyncioTestCase):
     RANKS = 1

@@ -24,6 +24,8 @@ import collections
 import logging
 import math
 import os
+import re
+import shlex
 import signal
 import subprocess
 import sys
@@ -41,6 +43,32 @@ SSH = ['ssh', '-o', 'BatchMode=yes', '-o', 'ControlPath=/tmp/g6shim-ssh-%C', '-o
 VOCAB = 154880
 ENGINE_MAX_LP = 20  # the engine's top lists hold 20 (serve.h LP_MAX = glue::LP_K); it clamps silently above
 FLOOR = -9999.0  # logprob sent for -inf / nan (the front end clamps at the same value)
+# A rank dir on another box ("host:/path") ends up in ssh's argv and in a remote shell command. The remote commands
+# shell-quote the path (a plain path comes out unchanged). The host must be a name or address: ssh reads a leading '-'
+# as an option. Neither part may hold control characters.
+REMOTE_DIR = re.compile(r'[A-Za-z0-9_][A-Za-z0-9._@-]*:/[^\x00-\x1f\x7f]*')
+
+
+def check_rank_dirs(dirs):
+    """None when the --rank-dirs list is usable, else why not: rank 0 is a local path, every other entry is a local
+    path or host:/path (over ssh)."""
+    if ':' in dirs[0]:
+        return 'the first --rank-dirs entry (rank 0) must be a local path'
+    bad = [d for d in dirs[1:] if ':' in d and not REMOTE_DIR.fullmatch(d)]
+    if bad:
+        return ('a remote --rank-dirs entry must be host:/absolute/path, the host a name or address (not starting with '
+                f'-), no control characters: {" ".join(map(repr, bad))}')
+    return None
+
+
+def remote_write_cmd(path, name):
+    """The shell command that writes stdin to path/name on another box: a tmp file, then a rename."""
+    tmp, dst = shlex.quote(f'{path}/{name}.tmp'), shlex.quote(f'{path}/{name}')
+    return f'cat > {tmp} && mv {tmp} {dst}'
+
+
+def remote_quit_cmd(path):
+    return f'touch {shlex.quote(path + "/quit")}'
 
 
 class Req:
@@ -165,7 +193,7 @@ class Shim:
         for d in self.a.rank_dirs:
             if ':' in d:
                 host, path = d.split(':', 1)
-                cmd = f'cat > {path}/req.{n}.tmp && mv {path}/req.{n}.tmp {path}/req.{n}'
+                cmd = remote_write_cmd(path, f'req.{n}')
                 procs.append((d, await asyncio.create_subprocess_exec(
                     *SSH, host, cmd, stdin=asyncio.subprocess.PIPE,
                     stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE)))
@@ -325,7 +353,7 @@ class Shim:
             try:
                 if ':' in d:
                     host, path = d.split(':', 1)
-                    os.spawnvp(os.P_WAIT, 'ssh', SSH + [host, f'touch {path}/quit'])
+                    os.spawnvp(os.P_WAIT, 'ssh', SSH + [host, remote_quit_cmd(path)])
                 else:
                     open(f'{d}/quit', 'w').close()
             except Exception as e:
@@ -351,8 +379,9 @@ async def main():
     if not 0 <= a.max_logprobs <= ENGINE_MAX_LP:
         ap.error(f'--max-logprobs must be 0..{ENGINE_MAX_LP} (the engine returns at most {ENGINE_MAX_LP} top entries)')
     logging.basicConfig(level='INFO', format='%(asctime)s %(levelname)s %(name)s: %(message)s')
-    if ':' in a.rank_dirs[0]:
-        ap.error('the first --rank-dirs entry (rank 0) must be a local path')
+    err = check_rank_dirs(a.rank_dirs)
+    if err:
+        ap.error(err)
     shim = Shim(a)
     shim.open_masters()
     loop = asyncio.get_running_loop()

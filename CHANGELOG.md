@@ -1,5 +1,14 @@
 # Changelog
 
+## 2026-10-10: `docker/gr8`: the launcher in the container, one per box
+
+- `docker/gr8 up | down | status | logs | check | show-config | prepare | smoke | bench` runs `./gr8 glm53` inside the
+  image with the same options, config file, environment, checks and handshake as a bare-metal box. Before, the containers
+  were started by hand from the `engine:` line in `out/supervisor.log`.
+- It adds no network settings: host network and the host's `/sys/class/infiniband`, so the launcher finds the peer index
+  and the rails as on bare metal. `GR8_USER` runs the container as an account without sudo or docker.
+- The runtime image has `jq`, which `./gr8 glm53 smoke` needs.
+
 ## 2026-10-10: serving is S2 in every build that has it; no `--s2` flag
 
 - A DEC_S2 build (TP=4, TP=3) always serves through S2: `g6m4 --serve DIR --s2-port N ...`. `--s2 DIR` is gone, so a

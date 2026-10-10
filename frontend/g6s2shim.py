@@ -45,7 +45,7 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from g6front import wire  # noqa: E402
-from g6shim import SSH, EOS_IDS, VOCAB, Shim as PlainShim  # noqa: E402
+from g6shim import SSH, EOS_IDS, VOCAB, Shim as PlainShim, check_rank_dirs, remote_quit_cmd, remote_write_cmd  # noqa: E402
 
 log = logging.getLogger('g6s2shim')
 
@@ -294,7 +294,7 @@ class Shim:
             if ':' in d:
                 host, path = d.split(':', 1)
                 p = await asyncio.create_subprocess_exec(
-                    *SSH, host, f'cat > {path}/{name}.tmp && mv {path}/{name}.tmp {path}/{name}',
+                    *SSH, host, remote_write_cmd(path, name),
                     stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE)
                 _, err = await p.communicate(body)
                 return f'{d}: rc {p.returncode} {err.decode(errors="replace").strip()}' if p.returncode else None
@@ -489,7 +489,7 @@ class Shim:
             try:
                 if ':' in d:
                     host, path = d.split(':', 1)
-                    os.spawnvp(os.P_WAIT, 'ssh', SSH + [host, f'touch {path}/quit'])
+                    os.spawnvp(os.P_WAIT, 'ssh', SSH + [host, remote_quit_cmd(path)])
                 else:
                     open(f'{d}/quit', 'w').close()
             except Exception as e:
@@ -528,8 +528,9 @@ async def main(argv=None):
     ap.add_argument('--stall-timeout', type=float, default=900.0, help='error an admitted request after this long with no resp')
     a = ap.parse_args(argv)
     logging.basicConfig(level='INFO', format='%(asctime)s %(levelname)s %(name)s: %(message)s')
-    if ':' in a.rank_dirs[0]:
-        ap.error('the first --rank-dirs entry (rank 0) must be a local path')
+    err = check_rank_dirs(a.rank_dirs)
+    if err:
+        ap.error(err)
     shim = Shim(a)
     shim.open_masters()
     loop = asyncio.get_running_loop()

@@ -129,6 +129,20 @@ class UnitTests(unittest.TestCase):
             self.assertEqual(g6s2shim.scan_numbers(d, 'req'), 10)
             self.assertEqual(g6s2shim.scan_numbers(d + '/none', 'req'), 0)
 
+    def test_rank_dirs_and_remote_commands(self):
+        ok = ['/g6/s2', '/g6/s2b', 'box2:/home/g6/s2', 'user@192.0.2.3:/srv/g6.d/s2']
+        self.assertIsNone(g6s2shim.check_rank_dirs(ok))
+        self.assertIn('rank 0', g6s2shim.check_rank_dirs(['box1:/g6/s2']))
+        for bad in ('box2:/g6/s2;id', 'box2:/g6/$(id)', 'box2:/g6/s2 && id', '-oProxyCommand=x:/g6', 'box2:g6/s2'):
+            self.assertIsNotNone(g6s2shim.check_rank_dirs(['/g6/s2', bad]), bad)
+        # a plain path goes out exactly as before; anything a shell would split or expand is quoted
+        self.assertEqual(g6s2shim.remote_write_cmd('/g6/s2', 'req.7'),
+                         'cat > /g6/s2/req.7.tmp && mv /g6/s2/req.7.tmp /g6/s2/req.7')
+        self.assertEqual(g6s2shim.remote_quit_cmd('/g6/s2'), 'touch /g6/s2/quit')
+        self.assertEqual(g6s2shim.remote_quit_cmd('/g6/s2;id'), "touch '/g6/s2;id/quit'")
+        self.assertEqual(g6s2shim.remote_write_cmd('/g6/$(id)', 'req.1'),
+                         "cat > '/g6/$(id)/req.1.tmp' && mv '/g6/$(id)/req.1.tmp' '/g6/$(id)/req.1'")
+
 
 class S2Base(unittest.IsolatedAsyncioTestCase):
     RANKS = 1

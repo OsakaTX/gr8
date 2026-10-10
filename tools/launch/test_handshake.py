@@ -137,6 +137,12 @@ class HandshakeTests(unittest.TestCase):
         finally:
             f.close()
 
+    def test_unsafe_home_is_refused(self):
+        v = self.assert_refused([hello(1), hello(2, home='/g6; touch /tmp/x'), hello(3)], 'G6_HOME')
+        self.assertEqual(v['values']['rank 2 (127.0.0.1)'], "'/g6; touch /tmp/x'")
+        self.assert_refused([hello(1, home='relative/g6'), hello(2), hello(3)], 'G6_HOME')
+        self.assert_refused([hello(1, home=None), hello(2), hello(3)], 'G6_HOME')
+
     def test_crossed_rails(self):
         self.assert_refused([hello(1, rails=['10.2.0.2', '10.1.0.2']), hello(2), hello(3)], 'rails')
 

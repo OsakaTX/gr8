@@ -10,6 +10,7 @@ The head answers `retry` while it has not finished its own checks, so a worker w
 the head answers. The head drops a rank that stops asking for 30 s and refuses the boot, naming that rank.
 """
 import json
+import re
 import socket
 import threading
 import time
@@ -17,6 +18,8 @@ import time
 from fabric import same_subnet
 
 PROTO = 1
+# a worker's G6_HOME becomes part of the head shim's ssh commands (host:<home>/s2): a plain absolute path only
+SAFE_HOME = re.compile(r'/[A-Za-z0-9._/+-]*')
 POLL_S = 1.0
 DROP_S = 30.0
 
@@ -57,6 +60,9 @@ def compare(ref, h, peer, have):
     if ref['members'][h['rank']] != h['lan'] or peer != h['lan']:
         return refusal('rank', both, lambda x: f'{x["rank"]} from {x["lan"]}',
                        f'rank {h["rank"]} is {ref["members"][h["rank"]]} in the member list, but the hello came from {peer}')
+    if not isinstance(h.get('home'), str) or not SAFE_HOME.fullmatch(h['home']):
+        return refusal('G6_HOME', both, lambda x: repr(x.get('home')),
+                       'G6_HOME must be an absolute path of letters, digits and ._/+- (the head uses it in ssh commands)')
     if h.get('fails') or ref.get('fails'):   # Head.wait_all lists every failing box once all have said hello
         return None
     if h['engine_build'] != ref['engine_build']:

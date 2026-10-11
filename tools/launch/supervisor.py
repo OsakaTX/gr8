@@ -64,6 +64,34 @@ def read_pid(path):
         return None
 
 
+def started_at(pid, proc='/proc'):
+    """When pid started, in seconds since the epoch, or None where /proc cannot say (macOS, a hidden process)."""
+    try:
+        with open(os.path.join(proc, str(pid), 'stat')) as f:
+            ticks = int(f.read().rsplit(')', 1)[1].split()[19])    # field 22, starttime; fields after comm start at 3
+        with open(os.path.join(proc, 'stat')) as f:
+            btime = next(int(line.split()[1]) for line in f if line.startswith('btime '))
+    except (OSError, IndexError, ValueError, StopIteration):
+        return None
+    return btime + ticks / os.sysconf('SC_CLK_TCK')
+
+
+def recorded(path, proc='/proc'):
+    """The pid in an out/<name>.pid file while that process runs, else None. The pid files outlive their processes
+    (a reboot, a kill -9), and a process that started after its file was written took the number later: it is not
+    ours, so nothing refuses a boot for it or signals it."""
+    pid = read_pid(path)
+    if not (pid and alive(pid)):
+        return None
+    t = started_at(pid, proc)
+    try:
+        if t is not None and t > os.path.getmtime(path) + 2:      # 2 s: btime is whole seconds
+            return None
+    except OSError:
+        return None
+    return pid
+
+
 def mem_available_gib():
     try:
         with open('/proc/meminfo') as f:
@@ -304,15 +332,15 @@ class Supervisor:
     def status(self):
         pid = read_pid(os.path.join(self.out, 'g6m4.pid'))
         s = {'t': 'status', 'rank': self.rank, 'lan': self.lan, 'state': self.state, 'engine_pid': pid,
-             'engine': bool(pid and alive(pid)), 'mem_gib': mem_available_gib(), 'home': self.home,
+             'engine': bool(recorded(os.path.join(self.out, 'g6m4.pid'))), 'mem_gib': mem_available_gib(),
+             'home': self.home,
              'variant': self.variant.name if self.variant else None, 'model_id': self.model_id}
         if s['engine'] is False:
             err = os.path.join(self.out, f'g6m4.r{self.rank}.err')
             s['last_line'] = tail(err, 1).strip()
         if self.rank == 0:
             for p in ('shim', 'front'):
-                q = read_pid(os.path.join(self.out, f'{p}.pid'))
-                s[p] = bool(q and alive(q))
+                s[p] = bool(recorded(os.path.join(self.out, f'{p}.pid')))
         return s
 
     def read_log(self, which, offset):
@@ -479,8 +507,8 @@ class Supervisor:
                 fails += modelset.check_tokenizer(self.ms)
         except (modelset.ModelError, OSError, RuntimeError) as e:
             fails.append(f'model: {e}')
-        p = read_pid(os.path.join(self.out, 'g6m4.pid'))
-        if p and alive(p):
+        p = recorded(os.path.join(self.out, 'g6m4.pid'))
+        if p:
             fails.append(f'an engine is already running (pid {p}): ./gr8 glm53 down first')
         for pid, cwd in running_engines():
             if pid != p:
@@ -800,15 +828,25 @@ def tail(path, n):
         return ''
 
 
+def signal_pid(pid, sig, name, log=log):
+    """Signal one of this box's processes; one that already exited, or another account's, is reported, not raised."""
+    try:
+        os.kill(pid, sig)
+    except ProcessLookupError:
+        pass
+    except PermissionError:
+        log(f'{name} (pid {pid}) belongs to another account: not stopped')
+
+
 def stop_local(home, log=log):
     """What scripts/stop.sh does, on this box: shim and front end, then quit files, then the engine."""
     out = os.path.join(home, 'out')
     for p in ('front', 'shim'):
-        pid = read_pid(os.path.join(out, f'{p}.pid'))
-        if pid and alive(pid):
-            os.kill(pid, signal.SIGTERM)
-    pid = read_pid(os.path.join(out, 'g6m4.pid'))
-    if not (pid and alive(pid)):
+        pid = recorded(os.path.join(out, f'{p}.pid'))
+        if pid:
+            signal_pid(pid, signal.SIGTERM, p, log)
+    pid = recorded(os.path.join(out, 'g6m4.pid'))
+    if not pid:
         return False
     for d in ('serve', 's2'):
         if os.path.isdir(os.path.join(home, d)):
@@ -822,7 +860,7 @@ def stop_local(home, log=log):
             pass
         time.sleep(0.1)
     if alive(pid):
-        os.kill(pid, signal.SIGTERM)
+        signal_pid(pid, signal.SIGTERM, 'engine', log)
         for _ in range(50):
             try:
                 os.waitpid(pid, os.WNOHANG)

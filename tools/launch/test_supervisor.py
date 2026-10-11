@@ -3,6 +3,7 @@
     python3 -m unittest discover -s tools/launch"""
 import os
 import socket
+import subprocess
 import sys
 import tempfile
 import threading
@@ -153,6 +154,82 @@ class EngineTests(unittest.TestCase):
         with open(os.path.join(home, 'bin', 'lib', 'libcublas.so.13'), 'w') as f:
             f.write('two')
         self.assertEqual(len({a, b, S.engine_build(home)}), 3)
+
+
+class PidFileTests(unittest.TestCase):
+    """out/g6m4.pid, shim.pid and front.pid outlive their processes; a number taken later is not ours."""
+    def pid_file(self, pid, age=0):
+        d = tempfile.mkdtemp()
+        p = os.path.join(d, 'g6m4.pid')
+        with open(p, 'w') as f:
+            f.write(f'{pid}\n')
+        t = time.time() - age
+        os.utime(p, (t, t))
+        return p
+
+    def fake_proc(self, pid, started):
+        """A /proc where pid started at `started` (seconds since the epoch): btime 1000, 100 ticks a second."""
+        proc = tempfile.mkdtemp()
+        os.makedirs(os.path.join(proc, str(pid)))
+        with open(os.path.join(proc, 'stat'), 'w') as f:
+            f.write('cpu  1 2 3\nbtime 1000\nprocesses 5\n')
+        ticks = int((started - 1000) * os.sysconf('SC_CLK_TCK'))
+        with open(os.path.join(proc, str(pid), 'stat'), 'w') as f:    # a comm with spaces and a ')' in it
+            f.write(f'{pid} (a b) c) S ' + ' '.join(['0'] * 18) + f' {ticks} 0 0\n')
+        return proc
+
+    def test_started_at_reads_field_22(self):
+        proc = self.fake_proc(4242, 5000.5)
+        self.assertAlmostEqual(S.started_at(4242, proc), 5000.5, places=1)
+        self.assertIsNone(S.started_at(4243, proc))
+        self.assertIsNone(S.started_at(4242, os.path.join(proc, 'none')))
+
+    def test_a_process_that_started_after_its_pid_file_is_not_ours(self):
+        me = os.getpid()                                      # alive, so only the start time decides
+        p = self.pid_file(me, age=3600)
+        self.assertIsNone(S.recorded(p, self.fake_proc(me, time.time() - 60)))     # started an hour after the file
+        self.assertEqual(S.recorded(p, self.fake_proc(me, time.time() - 7200)), me)  # started before it
+        self.assertEqual(S.recorded(p, os.path.join(tempfile.mkdtemp(), 'none')), me)  # no /proc: as before
+
+    def test_a_dead_pid_is_not_recorded(self):
+        p = subprocess.Popen([sys.executable, '-c', 'pass'])
+        p.wait()
+        self.assertIsNone(S.recorded(self.pid_file(p.pid)))
+
+    @unittest.skipUnless(os.path.isfile('/proc/self/stat'), 'needs /proc')
+    def test_down_leaves_a_process_that_took_a_stale_number_alone(self):
+        home = tempfile.mkdtemp()
+        os.makedirs(os.path.join(home, 'out'))
+        other = subprocess.Popen(['sleep', '60'])               # not ours: it started after the files below
+        self.addCleanup(other.wait)
+        self.addCleanup(other.kill)
+        for name in ('g6m4', 'shim', 'front'):
+            p = os.path.join(home, 'out', f'{name}.pid')
+            with open(p, 'w') as f:
+                f.write(f'{other.pid}\n')
+            os.utime(p, (time.time() - 3600,) * 2)          # written by a boot before a reboot
+        self.assertEqual(S.recorded(os.path.join(home, 'out', 'g6m4.pid')), None)
+        self.assertFalse(S.stop_local(home, log=lambda s: None))
+        time.sleep(0.2)
+        self.assertIsNone(other.poll(), 'stop_local signalled a process that was not ours')
+
+    @unittest.skipUnless(os.path.isfile('/proc/self/stat'), 'needs /proc')
+    def test_down_still_stops_our_own_processes(self):
+        home = tempfile.mkdtemp()
+        os.makedirs(os.path.join(home, 'out'))
+        front = subprocess.Popen(['sleep', '60'])
+        self.addCleanup(front.kill)
+        time.sleep(0.05)
+        with open(os.path.join(home, 'out', 'front.pid'), 'w') as f:    # written after it started, as spawn() does
+            f.write(f'{front.pid}\n')
+        S.stop_local(home, log=lambda s: None)
+        self.assertEqual(front.wait(timeout=5), -15)
+
+    def test_another_accounts_process_is_reported_not_raised(self):
+        said = []
+        with mock.patch.object(S.os, 'kill', side_effect=PermissionError):
+            S.signal_pid(4242, 15, 'front', said.append)
+        self.assertEqual(said, ['front (pid 4242) belongs to another account: not stopped'])
 
 
 if __name__ == '__main__':

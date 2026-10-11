@@ -25,6 +25,7 @@ use crate::util::{new_id, now_secs};
 use crate::{logprobs as L, metrics, sampling, State};
 
 const MAX_BODY: usize = 512 << 20;
+const BODY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
 // ---- errors ------------------------------------------------------------------------------------------------------
 
@@ -250,9 +251,10 @@ async fn read_json(req: Request<Incoming>) -> Result<Map<String, Value>, ApiErro
 
 /// The body as a JSON object, plus its raw bytes (sampling re-reads integers too large for serde's numbers).
 async fn read_json_raw(req: Request<Incoming>) -> Result<(Map<String, Value>, Bytes), ApiError> {
-    let body = http_body_util::Limited::new(req.into_body(), MAX_BODY)
-        .collect()
+    // a deadline for the whole body: a client that trickles it would otherwise hold its connection forever
+    let body = tokio::time::timeout(BODY_TIMEOUT, http_body_util::Limited::new(req.into_body(), MAX_BODY).collect())
         .await
+        .map_err(|_| ApiError::new(408, "request body not received in time", None))?
         .map_err(|e| ApiError::new(413, &format!("request body too large or unreadable: {e}"), None))?
         .to_bytes();
     match serde_json::from_slice::<Value>(&body) {
@@ -375,7 +377,7 @@ async fn chat_prepare(st: &'static State, body: &Map<String, Value>, raw: &[u8])
         &st.tok.eos_ids,
         st.tok.vocab_size,
         &st.tok.gen_defaults,
-        None,
+        (st.default_max_tokens > 0).then_some(st.default_max_tokens),
         st.max_logprobs(),
         true,
     )?;

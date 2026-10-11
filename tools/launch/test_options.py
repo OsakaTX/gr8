@@ -122,6 +122,7 @@ class ValidateTests(unittest.TestCase):
         self.check(['--peers', PEERS], 'PLAIN=1', {'PLAIN': '1'})
         self.check(['--peers', PEERS, '--ips', 'a,b,c,d'], 'IPS and IPS2 go together')
         self.check(['--peers', PEERS, '--ips', 'a,b', '--ips2', 'a,b'], 'IPS has 2 addresses')
+        self.check(['--peers', PEERS, '--default-max-tokens', '4k'], 'want a whole number')
 
     def test_peers_resolve(self):
         o = opt.parse(['--no-config', '--peers', '127.0.0.1,127.0.0.2'], {})

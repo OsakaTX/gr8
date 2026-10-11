@@ -144,6 +144,9 @@ class EndToEnd(unittest.TestCase):
             self.assertEqual(os.listdir(os.path.join(self.homes[i], 'cache', 'sets', set_id)).count(f'rank{i}'), 1)
             self.assertEqual(sorted(n for n in os.listdir(os.path.join(self.homes[i], 'cache', 'sets', set_id))
                                     if n.startswith('rank')), [f'rank{i}'])
+        # no --default-max-tokens unless DEFAULT_MAX_TOKENS is set: the front end keeps all the room
+        front = json.loads(read(os.path.join(self.homes[0], 'out', 'front.json')))
+        self.assertIsNone(front['default_max_tokens'])
         # a request through the shim: req.<id> lands in the head's directory only (the head engine sends the bytes on)
         self.assertEqual(self.request(), 6)
         self.assertTrue(any(n.startswith('req.') for n in os.listdir(os.path.join(self.homes[0], 's2'))))

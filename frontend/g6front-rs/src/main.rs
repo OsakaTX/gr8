@@ -21,7 +21,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use hyper::service::service_fn;
-use hyper_util::rt::TokioIo;
+use hyper_util::rt::{TokioIo, TokioTimer};
 use tokio::net::TcpListener;
 
 /// mimalloc: ~40% faster long-prompt encodes than glibc malloc on aarch64, and with `mi_collect` the tokenizer's
@@ -39,6 +39,8 @@ pub struct State {
     pub reasoning_fields: &'static [&'static str],
     pub prompt_tokens_details: bool,
     pub max_model_len_override: u64,
+    /// max_tokens for a chat request that names none; 0: all the room the context leaves
+    pub default_max_tokens: u64,
     pub started: u64,
 }
 
@@ -54,13 +56,16 @@ struct Args {
     log_level: String,
     workers: usize,
     encode_threads: usize,
+    default_max_tokens: u64,
+    max_connections: usize,
 }
 
 const USAGE: &str = "usage: g6front-rs --model-dir DIR [--engine-sock PATH] [--host H] [--port N]
                   [--served-model-name NAME ...] [--max-model-len N]
                   [--reasoning-fields both|reasoning|reasoning_content]
                   [--enable-prompt-tokens-details] [--log-level LEVEL]
-                  [--workers N] [--encode-threads N]";
+                  [--workers N] [--encode-threads N] [--default-max-tokens N]
+                  [--max-connections N]";
 
 fn parse_args() -> Result<Args, String> {
     let mut a = Args {
@@ -75,6 +80,8 @@ fn parse_args() -> Result<Args, String> {
         log_level: "INFO".into(),
         workers: 2,
         encode_threads: 0,
+        default_max_tokens: 0,
+        max_connections: 512,
     };
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
@@ -103,6 +110,13 @@ fn parse_args() -> Result<Args, String> {
             "--enable-prompt-tokens-details" => a.prompt_tokens_details = true,
             "--log-level" => a.log_level = next(&mut i, &flag, inline)?,
             "--workers" => a.workers = next(&mut i, &flag, inline)?.parse().map_err(|_| "--workers: not a number")?,
+            "--default-max-tokens" => {
+                a.default_max_tokens =
+                    next(&mut i, &flag, inline)?.parse().map_err(|_| "--default-max-tokens: not a number")?
+            }
+            "--max-connections" => {
+                a.max_connections = next(&mut i, &flag, inline)?.parse().map_err(|_| "--max-connections: not a number")?
+            }
             "--encode-threads" => {
                 a.encode_threads = next(&mut i, &flag, inline)?.parse().map_err(|_| "--encode-threads: not a number")?
             }
@@ -198,6 +212,7 @@ async fn serve(args: Args) -> Result<(), String> {
         reasoning_fields,
         prompt_tokens_details: args.prompt_tokens_details,
         max_model_len_override: args.max_model_len,
+        default_max_tokens: args.default_max_tokens,
         started: util::now_secs(),
     }));
     engine.start();
@@ -209,20 +224,36 @@ async fn serve(args: Args) -> Result<(), String> {
     log::info!("listening on http://{addr} (engine socket {})", args.engine_sock);
     let mut term =
         tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).map_err(|e| e.to_string())?;
+    // At most --max-connections at once: past it, new connections wait in the listen backlog. Each connection's
+    // headers must arrive within hyper's header read timeout (30 s), which only runs with a timer set.
+    let slots = Arc::new(tokio::sync::Semaphore::new(args.max_connections.max(1)));
     loop {
+        let slot = tokio::select! {
+            s = slots.clone().acquire_owned() => s.expect("semaphore closed"),
+            _ = tokio::signal::ctrl_c() => break,
+            _ = term.recv() => break,
+        };
         let (sock, _) = tokio::select! {
             r = listener.accept() => match r {
                 Ok(x) => x,
-                Err(e) => { log::warn!("accept: {e}"); continue; }
+                Err(e) => {
+                    // out of file descriptors (EMFILE) fails every accept at once: pause instead of spinning
+                    log::warn!("accept: {e}");
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    continue;
+                }
             },
             _ = tokio::signal::ctrl_c() => break,
             _ = term.recv() => break,
         };
         let _ = sock.set_nodelay(true);
         tokio::spawn(async move {
+            let _slot = slot;
             let svc = service_fn(move |req| api::route(st, req));
-            let conn =
-                hyper::server::conn::http1::Builder::new().keep_alive(true).serve_connection(TokioIo::new(sock), svc);
+            let conn = hyper::server::conn::http1::Builder::new()
+                .timer(TokioTimer::new())
+                .keep_alive(true)
+                .serve_connection(TokioIo::new(sock), svc);
             if let Err(e) = conn.await {
                 log::debug!("connection: {e}");
             }

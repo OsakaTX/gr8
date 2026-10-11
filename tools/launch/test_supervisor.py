@@ -114,6 +114,20 @@ class ControlPortTests(unittest.TestCase):
         self.assertEqual(got['v']['detail'], 'the head stopped: model: /m: no such directory')
 
 
+class FrontTests(unittest.TestCase):
+    def front_argv(self, *argv):
+        s = supervisor(*argv)
+        s.ms = mock.Mock(tokenizer='/t')
+        with mock.patch.object(s, 'spawn') as spawn, mock.patch.object(S.os, 'access', return_value=True):
+            s.start_front({'s2': True})
+        return spawn.call_args[0][1]
+
+    def test_default_max_tokens_reaches_the_front_end_only_when_set(self):
+        self.assertNotIn('--default-max-tokens', self.front_argv())
+        a = self.front_argv('--default-max-tokens', '16384')
+        self.assertEqual(a[a.index('--default-max-tokens') + 1], '16384')
+
+
 class EngineTests(unittest.TestCase):
     def test_the_engine_gets_the_plan_and_an_allowlist(self):
         s = supervisor()

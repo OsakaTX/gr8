@@ -312,4 +312,18 @@ mod tests {
         assert!(stop_ids(Value::from(vec![1; MAX_STOP_TOKEN_IDS])).is_ok());
         assert!(rejected(Value::from(vec![1; MAX_STOP_TOKEN_IDS + 1])).contains("at most"));
     }
+
+    fn max_tokens(body: &str, prompt_len: usize, max_model_len: u64, default: Option<u64>) -> u64 {
+        let m: Map<String, Value> = serde_json::from_str(body).unwrap();
+        let p = build(&m, body.as_bytes(), prompt_len, max_model_len, &[], VOCAB, &Map::new(), default, 20, true);
+        p.unwrap_or_else(|e| panic!("{}", e.message)).gen.max_tokens
+    }
+
+    #[test]
+    fn a_chat_request_without_max_tokens_gets_the_default_capped_by_the_room() {
+        assert_eq!(max_tokens("{}", 100, 393202, None), 393102); // no default: all the room
+        assert_eq!(max_tokens("{}", 100, 393202, Some(16384)), 16384);
+        assert_eq!(max_tokens("{}", 393000, 393202, Some(16384)), 202); // less room than the default
+        assert_eq!(max_tokens(r#"{"max_tokens": 200000}"#, 100, 393202, Some(16384)), 200000); // named: kept
+    }
 }

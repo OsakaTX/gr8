@@ -670,6 +670,8 @@ class Supervisor:
         front = [self.front_bin()]
         if not plan['s2'] and (o.get('FRONT') == 'py' or not os.access(self.front_bin(), os.X_OK)):
             front = [self.py(), '-m', 'g6front']
+        elif o.get('DEFAULT_MAX_TOKENS') != '0':
+            front += ['--default-max-tokens', o.get('DEFAULT_MAX_TOKENS')]
         self.spawn('front', self.pin() + front + ['--model-dir', self.ms.tokenizer, '--engine-sock', sock,
                                                   '--port', o.get('PORT')], os.path.join(REPO, 'frontend'))
 

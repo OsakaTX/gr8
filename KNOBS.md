@@ -89,6 +89,7 @@ manifest instead.
 | `NODE_IP` | `--node-ip` | found | box | this box's LAN address, when several peers are addresses of this box |
 | `CONTROL_PORT` | `--control-port` | 7340 | cluster | the supervisors' TCP port on the LAN (handshake, status, logs, down) |
 | `PORT` | `--port` | 8100 | cluster | the OpenAI API on the head |
+| `DEFAULT_MAX_TOKENS` | `--default-max-tokens` | 0 | box | the head's front end: `max_tokens` for a chat request that names none. 0 = all the room the context leaves, which is always past R (32,768), so every such request runs alone; a smaller value keeps them shared and ends longer answers there |
 | `JOIN_TIMEOUT` | `--join-timeout` | 600 | run | seconds for the mentat group to fill, for a worker to reach the head, and on the head from the first hello to the last (0 = forever) |
 | `CHECK` | `--no-check` | 1 | run | 0 = skip this box's checks (the model files are checked anyway) |
 | `G6_CLUSTER` | | none | | the config file when there is no `@FILE` |

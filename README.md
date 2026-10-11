@@ -174,7 +174,9 @@ while it allocates the KV pool, and names `--cap` and `--variant`.
   `--peers`, the workers wait for the head.
 - Decode slows past 32,768 tokens of context: from there the KV is spread across ranks, and every step gathers from
   all of them.
-- A request past 32,768 tokens waits for the pool to empty, and runs alone.
+- A request past 32,768 tokens waits for the pool to empty, and runs alone. Its size is the prompt plus `max_tokens`,
+  and a chat request without `max_tokens` gets all the room the context leaves, so it always runs alone: send
+  `max_tokens`, or set `--default-max-tokens`.
 - A request with `prompt_logprobs` runs its prompt as decode steps (about 13 ms a token at TP=4) and holds the others
   meanwhile. The shim caps those prompts at 1,024 tokens.
 - `top_k` and `min_p` are ignored with a warning. `logprobs` and `prompt_logprobs` work up to k = 20.

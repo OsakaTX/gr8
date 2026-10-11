@@ -102,7 +102,7 @@ downloads the drafter and converts its own rank.
 Nothing to build: CI publishes the image, `ghcr.io/kindlingai/gr8`. On every box, with the NVIDIA container toolkit:
 
     git clone https://github.com/kindlingai/gr8 && cd gr8
-    cp docker/.env.example docker/.env        # set MODEL, DRAFTER and PEERS: the same file on every box
+    cp docker/.env.example docker/.env        # set MODEL, PEERS and (TP=4 only) DRAFTER: the same file on every box
     docker compose -f docker/compose.yaml run --rm gr8 prepare
     docker compose -f docker/compose.yaml up -d
 

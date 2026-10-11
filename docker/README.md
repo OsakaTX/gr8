@@ -43,7 +43,7 @@ the launcher owns every default. Three more lines are for compose itself:
 |---|---|---|
 | `GR8_IMAGE` | `ghcr.io/kindlingai/gr8:latest` | the image |
 | `GR8_CACHE` | the `cache` volume | this box's part of the model: a host directory instead, owned by uid 1000 |
-| `GR8_HOME` | the `home` volume | logs and state (`out/`, `s2/`, `run/`): a host directory instead, owned by uid 1000 |
+| `GR8_HOME` | the `home` volume | logs and state (`out/`, `s2/`, `run/`): a host directory instead, owned by uid 1000, and not a bare-metal `G6_HOME` (its `bin/` is a build) |
 
 No topology needs ssh between the boxes: TP=6 serves through S2 like TP=4 and TP=3.
 

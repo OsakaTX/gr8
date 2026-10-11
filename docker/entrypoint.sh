@@ -28,6 +28,17 @@ case ${tp:-4} in
   6) bin=bin6 ;;
   *) echo "gr8: TP=$tp: want 4, 3 or 6" >&2; exit 2 ;;
 esac
+# A GR8_HOME host directory: docker creates a missing one owned by root, and a bare-metal G6_HOME has a real bin/,
+# where the link below would land inside it and the host's engine would run.
+if [ ! -w "$home" ]; then
+  echo "gr8: $home is not writable by uid $(id -u): a GR8_HOME host directory must be owned by it" \
+       "(chown $(id -u):$(id -g) DIR)" >&2
+  exit 2
+fi
+if [ -d "$home/bin" ] && [ ! -L "$home/bin" ]; then
+  echo "gr8: $home/bin is a directory (a bare-metal G6_HOME?): point GR8_HOME at a directory of its own" >&2
+  exit 2
+fi
 mkdir -p "$home/out"
 ln -sfn "/opt/gr8/$bin" "$home/bin"
 

@@ -23,10 +23,13 @@ services:
       - path: .env
         required: false
     environment:
-      # The container's own paths (the volumes below). Set here so a MODEL_CACHE or G6_HOME line in .env, meant for a
-      # bare-metal box, cannot point the launcher at a path that does not exist in the container.
+      # The container's own paths (the volumes below, the image's python and front end). Set here so a MODEL_CACHE,
+      # G6_HOME, PY or FRONT_BIN line in .env, meant for a bare-metal box, cannot point the launcher at a path that does
+      # not exist in the container.
       - G6_HOME=/var/lib/gr8/home
       - MODEL_CACHE=/var/lib/gr8/cache
+      - PY=/usr/bin/python3
+      - FRONT_BIN=/opt/gr8/bin/g6front-rs
     # The RoCE fabric and the front end need the box's real interfaces. The fabric bootstrap, the supervisors' control
     # port (7340), the S2 control port (7341) and the API (8100) are host ports.
     network_mode: host

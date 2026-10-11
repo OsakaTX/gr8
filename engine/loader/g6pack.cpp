@@ -342,11 +342,18 @@ bool Pack::open_manifest(const std::string& path, std::string& err)
             else { err = e.name + ": unknown expert_format " + xf->s; return false; }
         }
         if (!dtype_of(dt->s, e.dtype)) { err = e.name + ": unknown dtype " + dt->s; return false; }
-        uint64_t count = 1;
-        for (const J& d : sh->a) { e.shape.push_back(d.i); count *= (uint64_t)d.i; }
+        uint64_t count = 1, bytes = 0;
+        for (const J& d : sh->a)
+        {
+            e.shape.push_back(d.i);
+            if (d.i < 0 || __builtin_mul_overflow(count, (uint64_t)d.i, &count))
+            { err = e.name + ": bad shape"; return false; }
+        }
+        if (of->i < 0 || nb->i < 0) { err = e.name + ": negative offset or nbytes"; return false; }
         e.offset = (uint64_t)of->i;
         e.nbytes = (uint64_t)nb->i;
-        if (count * dtype_size(e.dtype) != e.nbytes) { err = e.name + ": nbytes != prod(shape) * dtype size"; return false; }
+        if (__builtin_mul_overflow(count, (uint64_t)dtype_size(e.dtype), &bytes) || bytes != e.nbytes)
+        { err = e.name + ": nbytes != prod(shape) * dtype size"; return false; }
         if (e.offset % align_) { err = e.name + ": offset not aligned"; return false; }
         if (!unhex(h->s, e.sha256)) { err = e.name + ": bad sha256"; return false; }
         entries_.push_back(std::move(e));
@@ -357,7 +364,8 @@ bool Pack::open_manifest(const std::string& path, std::string& err)
     {
         const Entry& e = entries_[i];
         if (e.offset < end) { err = e.name + ": overlaps previous tensor"; return false; }
-        end = e.offset + e.nbytes;
+        if (__builtin_add_overflow(e.offset, e.nbytes, &end))
+        { err = e.name + ": offset + nbytes overflows"; return false; }
         if (!index_.emplace(e.name, i).second) { err = e.name + ": duplicate name"; return false; }
     }
     if (end > pack_bytes_) { err = "tensors run past pack_bytes"; return false; }

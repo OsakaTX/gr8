@@ -49,6 +49,17 @@ namespace g6rt
 // After the weights and the KV pool, the rest of the boot (CUDA graphs, prefill staging, the drafter) took 4-5 GiB at
 // TP=3 and 6-7.6 GiB at TP=4 with DFlash2; G6_MEM_MIN (GiB, default 8) is the floor. The KV pool is checked layer by
 // layer as it is allocated, so a box under the floor stops before the OOM killer acts, and says why.
+// A G6_MEM_MIN that is not a number >= 0 stops the boot: atof read it as 0, which turned the floor off.
+inline double mem_min_gib()
+{
+    const char* s = getenv("G6_MEM_MIN");
+    if (!s) return 8.0;
+    char* end;
+    const double v = strtod(s, &end);
+    if (end == s || *end || !(v >= 0)) die(std::string("G6_MEM_MIN=") + s + ": want GiB, a number >= 0");
+    return v;
+}
+
 inline void check_headroom(int rank, int capacity, bool log)
 {
     double gib = -1;
@@ -60,7 +71,7 @@ inline void check_headroom(int rank, int capacity, bool log)
             if (sscanf(line, "MemAvailable: %ld kB", &kb) == 1) { gib = kb / 1048576.0; break; }
         fclose(f);
     }
-    static const double need = getenv("G6_MEM_MIN") ? atof(getenv("G6_MEM_MIN")) : 8.0;
+    static const double need = mem_min_gib();
     if (log) fprintf(stderr, "# rank %d: MemAvailable %.1f GiB after the weights and the KV pool\n", rank, gib);
     if (gib >= 0 && gib < need)
     {

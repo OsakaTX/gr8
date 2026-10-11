@@ -92,8 +92,11 @@ impl Plan {
             Some(p) => parse_sources(p, root, pack_bytes, &mut files)?,
             None => Vec::new(),
         };
-        let mut ext: Vec<(u64, u64)> =
-            tensors.iter().filter(|t| t.nbytes > 0).map(|t| (t.offset, t.offset + t.nbytes)).collect();
+        // checked: a release build wraps on overflow, and a wrapped end would pass the pack_bytes check below
+        let mut ext = Vec::new();
+        for t in tensors.iter().filter(|t| t.nbytes > 0) {
+            ext.push((t.offset, t.offset.checked_add(t.nbytes).ok_or("a tensor's offset + nbytes overflows")?));
+        }
         ext.sort_unstable();
         if ext.last().is_some_and(|e| e.1 > pack_bytes) {
             return Err("a tensor runs past pack_bytes".into());
@@ -194,7 +197,7 @@ fn parse_sources(path: &str, root: Option<&str>, pack_bytes: u64, files: &mut Ve
         if nbytes == 0 || nbytes != file_nbytes || (op == Op::Item128 && nbytes % HALF_PER_BIT != 0) {
             return Err(format!("{path}:{}: bad range size", n + 2));
         }
-        if pack_off < end || pack_off + nbytes > pack_bytes {
+        if pack_off < end || pack_off.checked_add(nbytes).map_or(true, |e| e > pack_bytes) {
             return Err(format!("{path}:{}: range overlaps or runs past pack_bytes", n + 2));
         }
         end = pack_off + nbytes;
@@ -248,5 +251,15 @@ mod tests {
         assert_eq!(p.files, vec!["pack".to_string(), "/r/a".to_string()]);
         assert_eq!(p.sources(5000, 13000).len(), 2);
         assert_eq!(p.pack_data(4096, 8192).len(), 0);
+    }
+
+    #[test]
+    fn offsets_that_overflow_are_refused() {
+        let t = [G6lExtent { offset: u64::MAX - 4095, nbytes: 8192 }];        // the end would wrap to 4096
+        assert!(Plan::new("pack", 24576, &t, None, None).err().unwrap().contains("overflows"));
+        let d = std::env::temp_dir().join("g6load-plan-overflow.sources");
+        std::fs::write(&d, format!("g6sources-v1 /r\n{} 8192 copy 0 8192 a\n", u64::MAX - 4095)).unwrap();
+        let t = [G6lExtent { offset: 0, nbytes: 4096 }];
+        assert!(Plan::new("pack", 24576, &t, Some(d.to_str().unwrap()), None).err().unwrap().contains("runs past"));
     }
 }

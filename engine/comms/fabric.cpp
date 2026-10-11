@@ -199,6 +199,10 @@ void relay_loop(int cpu) {
         const int slot = (int)wc[i].wr_id;
         char* buf = c.rbuf + (size_t)slot * kRelayBuf;
         RelayHdr h; memcpy(&h, buf, sizeof h);
+        // an inline write is at most what follows the header in its 64-byte slot; more would read past the slot
+        if (h.kind > 1 || (h.kind == 1 && h.len > (uint32_t)kRelayInline)) {
+          fail(c, "relay header", (int)h.len); break;
+        }
         while (c.inflight >= 1800 && !*c.err) {            // forward queue full: reap
           ibv_wc f; const int r = ibv_poll_cq(c.fwd_cq, 1, &f);
           if (r < 0 || (r == 1 && f.status != IBV_WC_SUCCESS)) { fail(c, "forward drain", r < 0 ? -1 : f.status); break; }

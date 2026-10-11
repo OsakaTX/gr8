@@ -1,6 +1,6 @@
 #!/bin/bash
 # Host-only tests (g++, no CUDA): the S2 batch planner (engine/runtime/s2_batch.h, with a DFlash2 session), the S2 control barrier and the
-# pool's prefix reuse (s2/pool.h).
+# pool's prefix reuse (s2/pool.h), and the pack manifest parser (engine/loader/g6pack.cpp).
 #   scripts/host_tests.sh
 set -eu
 REPO=$(cd "$(dirname "$0")/.." && pwd)
@@ -17,3 +17,6 @@ g++ -std=c++17 -O2 -Wall -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/test
 "$T/pool_reuse_test"
 g++ -std=c++17 -O2 -Wall -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/pool_conc_replay_test.cpp" -o "$T/pool_conc_replay_test"
 "$T/pool_conc_replay_test"
+g++ -std=c++20 -O2 -Wall -pthread -I "$REPO/engine/loader" "$REPO/engine/loader/tests/manifest_test.cpp" \
+  "$REPO/engine/loader/g6pack.cpp" -o "$T/manifest_test"
+"$T/manifest_test"

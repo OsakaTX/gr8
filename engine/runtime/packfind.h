@@ -3,8 +3,12 @@
 // with the same sha256 and size share one device copy, so replicated tensors are held once.
 // M5 replaces this by the builder's g6::DevImage (the pack streamed straight into one device allocation).
 #pragma once
+#include <cerrno>
+#include <cstdlib>
+#include <cstring>
 #include <map>
 #include <string>
+#include <unistd.h>
 #include "rank.cuh"
 #include "../loader/g6pack.h"
 #include "../loader/devimage.h"
@@ -142,11 +146,19 @@ inline bool rs_load_image(g6::Pack& pack, g6::DevImage& img, const std::string& 
     return true;
 }
 
-// The planned manifest of a rank image, in $TMPDIR (default /tmp).
+// The planned manifest of a rank image: a new file of this process in $TMPDIR (default /tmp), made with mkstemps, so
+// another account on the box can neither hold the name nor swap the file between the loader's write and our read.
+// The caller removes it once it has been read.
 inline std::string planned_manifest(int rank, const char* what)
 {
     const char* tmp = getenv("TMPDIR");
-    return std::string(tmp && *tmp ? tmp : "/tmp") + "/g6m4-rank" + std::to_string(rank) + "." + what + ".manifest.json";
+    const std::string sfx = ".manifest.json";
+    std::string p = std::string(tmp && *tmp ? tmp : "/tmp") + "/g6m4-rank" + std::to_string(rank) + "." + what +
+                    ".XXXXXX" + sfx;
+    const int fd = mkstemps(&p[0], (int)sfx.size());
+    if (fd < 0) die(p + ": " + strerror(errno));
+    close(fd);
+    return p;
 }
 
 // The base pack with its routed experts replaced by exlr8 v2 experts read from the raw width files (--v2): the Rust
@@ -159,9 +171,11 @@ inline void rs_load_v2(g6::Pack& pack, g6::DevImage& img, const std::string& man
     char err[1024] = "";
     void* h = g6l_v2_plan(manifest.c_str(), file.c_str(), v2.dir.c_str(), v2.slices.c_str(), v2.widths.c_str(),
                           planned.c_str(), err, sizeof err);
-    if (!h) die(std::string("v2 plan: ") + err);
+    if (!h) { unlink(planned.c_str()); die(std::string("v2 plan: ") + err); }
     std::string e;
-    if (!pack.open_manifest(planned, e)) die(planned + ": " + e);
+    const bool opened = pack.open_manifest(planned, e);
+    unlink(planned.c_str());
+    if (!opened) die(planned + ": " + e);
     if (pack.rank() != rank) die(manifest + ": manifest says rank " + std::to_string(pack.rank()));
     rs_fill(pack, img, rank, "base pack + v2 files", [&](const g6l_sink* s, g6l_stats* st, char* err, size_t n) {
         return g6l_plan_load(h, s, st, err, n);
@@ -176,9 +190,11 @@ inline void* rs_plan_release(g6::Pack& pack, int rank, const V2Src& v2)
     char err[1024] = "";
     void* h = g6l_release_plan(v2.dense.c_str(), v2.dir.c_str(), v2.slices.c_str(), v2.widths.c_str(), g6nr::NR, rank,
                                v2.qo, v2.trellis, planned.c_str(), err, sizeof err);
-    if (!h) die(std::string("release plan: ") + err);
+    if (!h) { unlink(planned.c_str()); die(std::string("release plan: ") + err); }
     std::string e;
-    if (!pack.open_manifest(planned, e)) die(planned + ": " + e);
+    const bool opened = pack.open_manifest(planned, e);
+    unlink(planned.c_str());
+    if (!opened) die(planned + ": " + e);
     return h;
 }
 

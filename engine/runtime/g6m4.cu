@@ -289,8 +289,9 @@ int main(int argc, char** argv)
     cfg.relay_cpu = cfg.proxy_cpu > 7 ? cfg.proxy_cpu - 8 : -1;   // --ring: the relay thread's own core (N-1..N-7 are proxies)
     g6::Fabric fab;
     boot_rank = cfg.rank;
+    mem_min_gib();                      // a bad G6_MEM_MIN stops the boot here, not after the weights have loaded
     boot("start");
-    cfg.xtrace = 1;                     // G6_XTRACE=1: stage-0 trace on the decode fabric only (xtrace.h); off by default
+    cfg.xtrace = 1;                    // G6_XTRACE=1: stage-0 trace on the decode fabric only (xtrace.h); off by default
     fab.init(cfg);
     cfg.xtrace = 0;
     const g6::FabricDev f = fab.dev();
@@ -948,7 +949,7 @@ int main(int argc, char** argv)
             sp.top_p = rq.top_p;
             sp.lp = rq.lp; sp.plp = rq.plp;
             em.open(serve, q, R == 0, rq);
-            if (sp.prompt.empty() || sp.n_gen < 1 || (int)sp.prompt.size() + sp.n_gen + 2 * K > cap)
+            if (sp.prompt.empty() || sp.n_gen < 1 || (long long)sp.prompt.size() + sp.n_gen + 2LL * K > cap)
             {
                 em.end("error", 0, 0, 0, nullptr);
                 continue;

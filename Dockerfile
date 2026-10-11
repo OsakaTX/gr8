@@ -64,6 +64,11 @@ RUN scripts/build.sh /out/bin6
 FROM engine-src AS engine-tp3
 RUN G6_NR=3 scripts/build.sh /out/bin3
 
+# rust-dist holds the Rust binaries only: CI builds them on a hosted arm runner, and its engine job links libg6load.a
+FROM scratch AS rust-dist
+COPY --from=loader /out/libg6load.a /out/g6load /
+COPY --from=front /out/g6front-rs /
+
 # dist holds the shipped binaries: bin/ is TP=4, bin6/ is TP=6 and bin3/ is TP=3. g6load (the Hugging Face fetch's
 # planner and checker) goes in both. build.sh's CPU test binaries
 # and objects stay behind. tr3_e4m3_test is the GPU decode check build.sh cannot run without a GPU.
@@ -78,14 +83,24 @@ COPY --from=engine-tp3 /out/bin3/g6m4 /out/bin3/m4sim /out/bin3/gpuprobe /out/bi
 
 FROM nvidia/cuda:${CUDA_VERSION}-runtime-${UBUNTU} AS runtime
 # libibverbs1 + ibverbs-providers (mlx5) for the fabric, ibverbs-utils for ibv_devinfo, python3 for the shims,
-# python3-numpy + libxxhash0 for tools/convert, openssh-client + rsync for the shim's writes to the other ranks.
-# The runtime base already has cuBLAS.
+# python3-numpy + libxxhash0 for tools/convert, openssh-client + rsync for TP=6's writes to the other ranks,
+# curl + jq for smoketest/run.sh (./gr8 glm53 smoke). The runtime base already has cuBLAS.
 # hadolint ignore=DL3008
 RUN apt-get update \
  && apt-get install -y --no-install-recommends libibverbs1 ibverbs-providers ibverbs-utils python3 python3-numpy \
-      libxxhash0 openssh-client rsync curl \
+      libxxhash0 openssh-client rsync curl jq \
  && rm -rf /var/lib/apt/lists/*
 WORKDIR /opt/gr8
 COPY . .
 COPY --from=dist / .
-ENV PATH=/opt/gr8/bin:$PATH PYTHONPATH=/opt/gr8/frontend
+# The container runs as uid 1000 (the base image's ubuntu account) on a read-only image. Its writable state is two
+# volumes (docker/compose.yaml): the model cache and G6_HOME, which docker fills from these empty, uid-1000 directories
+# on first use. bench/pbench.py appends results.jsonl next to itself, so that file links into G6_HOME/out.
+RUN mkdir -p /var/lib/gr8/home /var/lib/gr8/cache \
+ && chown 1000:1000 /var/lib/gr8/home /var/lib/gr8/cache \
+ && ln -s /var/lib/gr8/home/out/pbench-results.jsonl bench/results.jsonl
+ENV PATH=/opt/gr8/bin:$PATH PYTHONPATH=/opt/gr8/frontend HOME=/tmp \
+    G6_HOME=/var/lib/gr8/home MODEL_CACHE=/var/lib/gr8/cache PY=/usr/bin/python3
+USER 1000:1000
+# ./gr8 glm53 COMMAND; with no command, `up` in the foreground
+ENTRYPOINT ["/opt/gr8/docker/entrypoint.sh"]

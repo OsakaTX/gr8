@@ -242,6 +242,7 @@ class Supervisor:
         self.head_ready = threading.Event()
         self.ready_ranks = set()
         self.engine = None
+        self.helpers = {}             # the head's front end and shim: name -> Popen
         self.agent = self.api_agent = None
         self.rank, self.lan, self.members, self.hs = None, None, [], {}
         self.state = 'starting'
@@ -604,6 +605,7 @@ class Supervisor:
                                  env=env, start_new_session=True)
         with open(os.path.join(self.out, f'{name}.pid'), 'w') as f:
             f.write(f'{p.pid}\n')
+        self.helpers[name] = p
         return p
 
     def boot(self):
@@ -755,6 +757,13 @@ class Supervisor:
             why = f'engine exited ({self.engine.returncode}); last lines of g6m4.r{self.rank}.err:\n' + \
                   tail(os.path.join(self.out, f'g6m4.r{self.rank}.err'), 20)
             raise Stop(1, why)
+        # the head's front end and shim: without either the API is gone, so the cluster stops as for an engine
+        # (polling also reaps them; a zombie still answered kill(pid, 0), and status called it running)
+        for name, p in self.helpers.items():
+            if p.poll() is not None:
+                label = {'front': 'front end'}.get(name, name)
+                raise Stop(1, f'{label} exited ({p.returncode}); last lines of {name}.log:\n' +
+                           tail(os.path.join(self.out, f'{name}.log'), 20))
 
     def run_forever(self):
         while True:
@@ -876,6 +885,9 @@ def stop_local(home, log=log):
 def main(o):
     sup = Supervisor(o)
     signal.signal(signal.SIGTERM, lambda *_: sup.request_stop('SIGTERM'))
+    # Ctrl-C on `up --foreground`: stop as for SIGTERM. Uncaught, KeyboardInterrupt skipped shutdown() and left
+    # the engine (in its own session) running.
+    signal.signal(signal.SIGINT, lambda *_: sup.request_stop('SIGINT'))
     try:
         sup.run()
         code = 0

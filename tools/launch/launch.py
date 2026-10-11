@@ -370,6 +370,11 @@ def main(argv):
         print(o.get(rest[0]) or '')
         return 0 if o.get(rest[0]) else 1
     if cmd == 'restart':
+        if os.environ.get('GR8_CONTAINER') == '1':
+            # down ends this container's supervisor, and with it the container this restart runs in
+            print('gr8: restart does not work inside the container: run down, then `docker compose up -d` on every '
+                  'box', file=sys.stderr)
+            return 2
         cmd_down(rest)
         return cmd_up(rest)
     f = {'up': cmd_up, 'down': cmd_down, 'status': cmd_status, 'logs': cmd_logs, 'show-config': cmd_show_config,

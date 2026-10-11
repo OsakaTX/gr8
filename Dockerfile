@@ -99,7 +99,7 @@ COPY --from=dist / .
 RUN mkdir -p /var/lib/gr8/home /var/lib/gr8/cache \
  && chown 1000:1000 /var/lib/gr8/home /var/lib/gr8/cache \
  && ln -s /var/lib/gr8/home/out/pbench-results.jsonl bench/results.jsonl
-ENV PATH=/opt/gr8/bin:$PATH PYTHONPATH=/opt/gr8/frontend HOME=/tmp \
+ENV PATH=/opt/gr8/bin:$PATH PYTHONPATH=/opt/gr8/frontend HOME=/tmp GR8_CONTAINER=1 \
     G6_HOME=/var/lib/gr8/home MODEL_CACHE=/var/lib/gr8/cache PY=/usr/bin/python3
 USER 1000:1000
 # ./gr8 glm53 COMMAND; with no command, `up` in the foreground

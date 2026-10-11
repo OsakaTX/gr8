@@ -25,8 +25,9 @@ container healthy once this box's supervisor reports the cluster serving. Then, 
 
 and on the head, `docker compose -f docker/compose.yaml exec gr8 /opt/gr8/gr8 glm53 smoke` checks its API.
 
-`down` stops the cluster and every container exits 0 and stays down. When a rank fails, every box's container exits
-non-zero and restarts, and the boxes boot again together: a box that restarts first waits for the head's next boot. `docker compose down` on one box stops that box, and the
+`down` stops the cluster and every container exits 0 and stays down; to boot again, `up -d` on every box (`restart`
+does not work inside the container: its `down` ends the container it runs in). When a rank fails, or the head's
+front end or shim exits, every box's container exits non-zero and restarts, and the boxes boot again together: a box that restarts first waits for the head's next boot. `docker compose down` on one box stops that box, and the
 cluster with it: the other boxes restart and wait for it, retrying every `JOIN_TIMEOUT` (600 s). A watchdog that
 needs to stop a wedged rank should end its `g6m4`, not its container: the supervisor then reports the failure, and
 every box restarts and boots again together. Killing the container takes the supervisor with it, so no supervisor

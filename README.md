@@ -122,7 +122,7 @@ mentat daemon (`--mentat localhost`, the default).
 | command | what it does |
 |---|---|
 | `up [OPTIONS]` | start this box's supervisor and follow it until the cluster serves |
-| `down`, `restart` | stop every box, or stop and boot again |
+| `down`, `restart` | stop every box, or stop and boot again (in Docker: `down`, then `up -d` on every box) |
 | `status` | every box's state, engine and free memory, and the head's front end and `/health` |
 | `logs [rank\|shim\|front\|supervisor] [-f]` | a log from any box |
 | `prepare [OPTIONS]` | fill `--model-cache` with this box's part, without booting |

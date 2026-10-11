@@ -157,6 +157,16 @@ class GetTests(unittest.TestCase):
         self.assertIn('--tp is needed', err)
 
 
+class RestartTests(unittest.TestCase):
+    def test_restart_is_refused_inside_the_container(self):
+        r = subprocess.run([sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), 'launch.py'),
+                            'restart', '--no-config'], env={**os.environ, 'GR8_CONTAINER': '1'},
+                           capture_output=True, text=True, timeout=60)
+        self.assertEqual(r.returncode, 2)
+        self.assertIn('run down, then `docker compose up -d` on every box', r.stderr)
+        self.assertEqual(r.stdout, '')           # down never ran
+
+
 class PathTests(unittest.TestCase):
     def test_local_paths_become_absolute(self):
         d = tempfile.mkdtemp()

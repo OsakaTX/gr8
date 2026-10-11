@@ -8,6 +8,7 @@ import asyncio
 import json
 import os
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -298,6 +299,37 @@ class EndToEnd(unittest.TestCase):
             self.assertTrue(st[i].startswith('failed: the head stopped the cluster: rank 2'), st)
         for h in self.homes:
             self.assertFalse(running(int(read(os.path.join(h, 'out', 'g6m4.pid')))), h)
+
+    def states(self):
+        return [json.loads(read(os.path.join(h, 'out', 'gr8.state')))['state'] for h in self.homes]
+
+    def test_a_front_end_that_dies_stops_the_cluster(self):
+        res = self.up_all()
+        self.assertTrue(all(rc == 0 for rc, _ in res), res)
+        os.kill(int(read(os.path.join(self.homes[0], 'out', 'front.pid'))), 9)
+        pids = [int(read(os.path.join(h, 'out', 'g6m4.pid'))) for h in self.homes]
+        for _ in range(300):
+            st = self.states()
+            if all(s == 'stopped' or s.startswith('failed') for s in st) and not any(running(p) for p in pids):
+                break
+            time.sleep(0.1)
+        self.assertTrue(st[0].startswith('failed: front end exited (-9)'), st)
+        for i in range(1, TP):    # so a container that restarts on failure boots again with the others
+            self.assertTrue(st[i].startswith('failed: the head stopped the cluster: front end exited'), st)
+        self.assertFalse([p for p in pids if running(p)])
+
+    def test_sigint_stops_a_box_as_sigterm_does(self):
+        res = self.up_all()
+        self.assertTrue(all(rc == 0 for rc, _ in res), res)
+        sup = int(read(os.path.join(self.homes[3], 'out', 'supervisor.pid')))
+        eng = int(read(os.path.join(self.homes[3], 'out', 'g6m4.pid')))
+        os.kill(sup, signal.SIGINT)              # Ctrl-C on `up --foreground`
+        for _ in range(300):
+            if not running(sup) and not running(eng):
+                break
+            time.sleep(0.1)
+        self.assertFalse(running(eng), 'the engine outlived its supervisor')
+        self.assertEqual(self.states()[3], 'stopped')
 
     def test_mentat_mode(self):
         """Four fake mentat daemons, one per box, sharing one agent table: each supervisor registers, the boxes elect

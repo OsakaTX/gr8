@@ -2,6 +2,7 @@
 """The option parser, the config file, precedence and the canonical option set. No network, no GPU.
     python3 -m unittest discover -s tools/launch"""
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -132,6 +133,28 @@ class ValidateTests(unittest.TestCase):
         with self.assertRaises(opt.OptionError) as e:
             opt.resolve_peers(o)
         self.assertIn('not ssh aliases', str(e.exception))
+
+
+class GetTests(unittest.TestCase):
+    """launch.py get: TP for ./gr8 glm53 build, PORT for smoke and bench, on a box whose options need not boot."""
+    def get(self, *argv):
+        r = subprocess.run([sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), 'launch.py'), 'get',
+                            *argv], capture_output=True, text=True, timeout=60)
+        return r.returncode, r.stdout.strip(), r.stderr
+
+    def test_port_needs_no_bootable_options(self):
+        d = tempfile.mkdtemp()
+        self.assertEqual(self.get('PORT', '--no-config')[:2], (0, '8100'))    # up's options came on its command line
+        self.assertEqual(self.get('PORT', '@' + write(d, 'c.env', 'PORT=8200\n'))[:2], (0, '8200'))
+        rc, _, err = self.get('PORT', '@' + write(d, 'bad.env', 'PORT=$X\n'))
+        self.assertEqual(rc, 2)
+        self.assertIn('the file is parsed', err)
+
+    def test_tp_is_still_validated(self):
+        self.assertEqual(self.get('TP', '--no-config', '--peers', PEERS)[:2], (0, '4'))
+        rc, _, err = self.get('TP', '--no-config')
+        self.assertEqual(rc, 2)
+        self.assertIn('--tp is needed', err)
 
 
 class PathTests(unittest.TestCase):

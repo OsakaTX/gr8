@@ -365,8 +365,8 @@ def main(argv):
     cmd, rest = argv[0], argv[1:]
     if cmd == 'supervise':
         sv.main(parse(rest))
-    if cmd == 'get':   # one effective option, for ./gr8 glm53 build
-        o = parse(rest[1:])
+    if cmd == 'get':   # one effective option: TP for ./gr8 glm53 build (validate derives it), PORT for smoke and bench
+        o = parse(rest[1:], check=rest[0] == 'TP')
         print(o.get(rest[0]) or '')
         return 0 if o.get(rest[0]) else 1
     if cmd == 'restart':

@@ -86,7 +86,10 @@ The light gates, on the target topology:
     python3 bench/gate/gate.py check --baseline bench/gate/baselines/tp4.json
 
 `--health` wants the rank health probe's result for this boot. `./gr8 glm53 --ssh up` at TP=6 writes it. Otherwise
-run `scripts/rank_health.sh` before `./gr8 glm53 up` (the probe refuses a box with a model booted).
+run `scripts/rank_health.sh` before `./gr8 glm53 up` (the probe refuses a box with a model booted). The probe is still
+the ssh launchers' tool, at every TP: it needs `config/cluster.env` with `HOSTS`, `IPS`, `IPS2`, `G6_HOME` and
+`PROXY_CPU`, and passwordless ssh from the head to every box. Without them, `gate.py run --no-health` runs, but its
+records do not count for `baseline` or `check`.
 
 `./gr8 glm53 bench --tag <name>` runs pbench alone. Numbers for the README come from RigMark 1.0.0 at `reasoning_effort`
 low, GPU clocks capped at 2200 MHz.

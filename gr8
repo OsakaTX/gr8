@@ -78,7 +78,7 @@ case $cmd in
       exec python3 "$REPO/tools/launch/launch.py" "$cmd" "$@"
     fi
     echo "gr8: --ssh is deprecated; the ssh launchers stay for one release. Without --ssh, ./gr8 glm53 $cmd runs on" >&2
-    echo "     every box instead (README, step 5)." >&2 ;;
+    echo "     every box instead (README, Running it)." >&2 ;;
 esac
 
 # config: the cluster file, through common.sh, so every value means what it means to the launchers.
@@ -272,13 +272,11 @@ case $cmd in
   status) config; do_status ;;
   logs) config; do_logs "$@" ;;
   smoke)
-    if [ -f "${G6_CLUSTER:-$REPO/config/cluster.env}" ]; then config; fi
-    PORT=${PORT:-8100}
+    PORT=$(python3 "$REPO/tools/launch/launch.py" get PORT) || exit 2   # the port as up reads it, from the same file
     url=${1:-$(api)}; [ $# -gt 0 ] && shift
     exec bash "$REPO/smoketest/run.sh" "$url" "$@" ;;
   bench)
-    if [ -f "${G6_CLUSTER:-$REPO/config/cluster.env}" ]; then config; fi
-    PORT=${PORT:-8100}
+    PORT=$(python3 "$REPO/tools/launch/launch.py" get PORT) || exit 2
     exec python3 "$REPO/bench/pbench.py" --url "$(api)" "$@" ;;
   build)
     # The TP comes from the options when they name one (--tp, TP=, or the peer count); the build box may have none.

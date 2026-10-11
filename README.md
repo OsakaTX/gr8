@@ -68,9 +68,10 @@ RigMark. One test window on one cluster.
       echo 'vm.compaction_proactiveness = 0' > /etc/sysctl.d/90-g6-no-proactive-compaction.conf
       sysctl -w vm.compaction_proactiveness=0
 
-- To build: CUDA 13 (`nvcc` with `sm_121a`), g++ with C++20, rdma-core / libibverbs-dev, cargo, and Python 3. The
-  stock DGX OS (Ubuntu 24.04) has all of them except cargo. Or, in place of all of these, Docker with the NVIDIA
-  container toolkit (DGX OS has both): see [In Docker](#in-docker).
+- To build: CUDA 13 (`nvcc` with `sm_121a`), g++ with C++20, rdma-core / libibverbs-dev, Rust through
+  [rustup](https://rustup.rs) (the front end needs Rust 1.85 or later; Ubuntu 24.04's `cargo` package is 1.75), and
+  Python 3 with venv. The stock DGX OS (Ubuntu 24.04) has all of them except Rust. Or, in place of all of these, Docker
+  with the NVIDIA container toolkit (DGX OS has both): see [In Docker](#in-docker).
 
 ## Quick start
 
@@ -78,14 +79,16 @@ On every box:
 
     git clone https://github.com/kindlingai/gr8 && cd gr8
     TP=4 BUNDLE_LIBS=1 ./gr8 glm53 build
+    python3 -m venv venv && venv/bin/pip install -r frontend/requirements.txt    # the python the head runs the shim on
     ./gr8 glm53 up --tp 4 --peers 10.0.0.1,10.0.0.2,10.0.0.3,10.0.0.4 \
         --model https://huggingface.co/kindlingai/glm-5.3-exlr8-k2-k3-k4 --model-cache /opt/g6/cache \
         --drafter https://huggingface.co/incoai/GLM-5.3-DFlash2
 
-Then, from any box:
+`--model-cache` must be a directory you can create or write (here, `sudo mkdir -p /opt/g6/cache && sudo chown $USER
+/opt/g6/cache` first). Then `./gr8 glm53 status` from any box, and on the head (the first address in `--peers`):
 
     ./gr8 glm53 status        # every box, the front end, /health
-    ./gr8 glm53 smoke         # questions with answers that can be checked
+    ./gr8 glm53 smoke         # questions with answers that can be checked (from another box: smoke http://10.0.0.1:8100)
     curl http://10.0.0.1:8100/v1/chat/completions -H 'Content-Type: application/json' \
       -d '{"model":"glm-5.3","messages":[{"role":"user","content":"Hello"}],"max_tokens":64}'
 
@@ -125,7 +128,7 @@ mentat daemon (`--mentat localhost`, the default).
 | `logs [rank\|shim\|front\|supervisor] [-f]` | a log from any box |
 | `prepare [OPTIONS]` | fill `--model-cache` with this box's part, without booting |
 | `check`, `show-config` | what would stop this box's boot; every option and where it came from |
-| `smoke`, `bench` | the smoke test, and prefill and decode benchmarks, against the head's API |
+| `smoke`, `bench` | the smoke test, and prefill and decode benchmarks, against the API on this box (run them on the head) |
 | `build` | the engine and the Rust front end, into `bin/` |
 
 Options come from the command line, then a config file (`@FILE`, else `./cluster.env`; see
@@ -190,8 +193,9 @@ while it allocates the KV pool, and names `--cap` and `--variant`.
 Before the release, the model was converted into per-rank packs from the TR3 expert checkpoint
 ([davidsyoung/GLM-5.3-EXL3-TR3-3.25bpw](https://huggingface.co/davidsyoung/GLM-5.3-EXL3-TR3-3.25bpw)) and GPTQ dense
 codes ([adapt-ai-systems/glm-5.3-full-exl3-gptq-dense](https://huggingface.co/adapt-ai-systems/glm-5.3-full-exl3-gptq-dense)).
-Packs still boot: `./gr8 glm53 packs TR3_DIR GPTQ_DIR OUT_DIR [DRAFTER_DIR]` builds them (about 390 GB written, CPU
-only), and `--model OUT_DIR` boots from them. Most users should use the release.
+Packs still boot: `./gr8 glm53 packs TR3_DIR GPTQ_DIR OUT_DIR [DRAFTER_DIR]` builds them, with `GPTQ_DIR` the
+GPTQ repo's `tp4/` or `tp6/` folder (about 390 GB written, CPU only), and `--model OUT_DIR` boots from them. Most users
+should use the release.
 
 ## Layout
 

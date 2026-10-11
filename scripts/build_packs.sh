@@ -12,6 +12,7 @@
 set -eu
 TR3=$1; D8=$2; OUT=$3
 REPO=$(cd "$(dirname "$0")/.." && pwd)
+[ -d "$D8/r0" ] || { echo "no $D8/r0: pass the GPTQ repo's tp4/ or tp6/ folder, not the repo itself" >&2; exit 2; }
 mkdir -p "$OUT"
 if [ -d "$D8/r4" ]; then NR=6; else NR=4; fi   # no r4: TP4, or an incomplete TP6 download (the hashes below catch that)
 # the D8 dirs must be the rank-specific codes we built from; these are their layer-000 sha256 prefixes
